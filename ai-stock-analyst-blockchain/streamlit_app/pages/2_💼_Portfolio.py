@@ -1,4 +1,7 @@
 # modified file: ai-stock-analyst-blockchain/streamlit_app/pages/2_💼_Portfolio.py
+# FIXES APPLIED:
+# 1. Fixed `UnhashableParamError` by changing `generate_portfolio_charts(advisor)` to `generate_portfolio_charts(_advisor)`
+# 2. Fixed `too many values to unpack` by correctly handling the string response from `add_investment_blockchain`
 
 import streamlit as st
 import sys
@@ -8,7 +11,8 @@ from datetime import datetime
 import plotly.graph_objects as go
 import plotly.express as px
 
-
+# --- Path Setup ---
+# Add parent directory (streamlit_app) to path to import modules
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 try:
@@ -102,8 +106,13 @@ def init_session_state():
 init_session_state()
 
 # --- Helper Function for Visualization ---
+#
+# ✅ --- FIX 1 ---
+# Renamed `advisor` to `_advisor` to fix the `UnhashableParamError`.
+# The leading underscore tells Streamlit's caching to ignore this argument.
+#
 @st.cache_data(ttl=300) # Cache charts for 5 minutes
-def generate_portfolio_charts(portfolio_data, advisor):
+def generate_portfolio_charts(portfolio_data, _advisor):
     """
     Generates Plotly charts for portfolio visualization.
     """
@@ -117,8 +126,9 @@ def generate_portfolio_charts(portfolio_data, advisor):
 
     # Prepare data for charts
     for inv in portfolio_data:
-        symbol = advisor.smart_symbol_lookup(inv['company'])
-        current_price = advisor.get_current_price(symbol)
+        # Use `_advisor` internally now
+        symbol = _advisor.smart_symbol_lookup(inv['company'])
+        current_price = _advisor.get_current_price(symbol)
         
         if current_price == 0:
             current_price = inv['purchase_price']  # Fallback
@@ -128,7 +138,8 @@ def generate_portfolio_charts(portfolio_data, advisor):
         
         # Get sector (best-effort)
         try:
-            profile = advisor.get_company_profile(symbol)
+            # Use `_advisor` internally now
+            profile = _advisor.get_company_profile(symbol)
             sector = profile.get('finnhubIndustry', 'Other')
         except Exception:
             sector = 'Other'
@@ -266,7 +277,11 @@ with st.expander("📝 Add Investment Form", expanded=False):
         else:
             st.error("❌ Please fill all fields with valid values")
     
-    # Handle blockchain addition - Using the FIXED logic
+    #
+    # ✅ --- FIX 2 ---
+    # This block now correctly handles the *string* response from
+    # `add_investment_blockchain`, fixing the "too many values to unpack" error.
+    #
     if add_blockchain_btn:
         if company and shares > 0 and price > 0:
             with st.spinner(f"Adding {company} to blockchain... This may take 10-30 seconds"):
@@ -283,9 +298,10 @@ with st.expander("📝 Add Investment Form", expanded=False):
                     # Check the string response for success
                     if "Transaction Hash" in result_str:
                         st.success("✅ Investment added to blockchain!")
-                        st.markdown(result_str)
+                        st.markdown(result_str) # Show the full success message
                         st.rerun()
                     else:
+                        # Show the error message if it's not a success
                         st.error(f"❌ Blockchain transaction failed: {result_str}")
                         
                 except Exception as e:
@@ -358,14 +374,18 @@ else:
             help="Number of unique assets in your portfolio"
         )
 
-    # --- NEW: 3. Portfolio Visualization Section ---
+    # --- 3. Portfolio Visualization Section ---
     st.markdown("---")
     st.subheader("🎨 Portfolio Visualization")
     
     with st.spinner("Generating portfolio charts..."):
+        #
+        # ✅ --- FIX 1 (call) ---
+        # Pass the advisor object using the `_advisor=` kwarg.
+        #
         pie_stock_fig, pie_sector_fig, bar_fig = generate_portfolio_charts(
             portfolio, 
-            st.session_state.advisor
+            _advisor=st.session_state.advisor
         )
     
     if pie_stock_fig:
@@ -380,7 +400,7 @@ else:
         st.info("Could not generate portfolio charts. Data might be processing.")
 
 
-    # --- 4. Detailed Holdings Section (NEW: Interactive List) ---
+    # --- 4. Detailed Holdings Section (Interactive List) ---
     st.markdown("---")
     st.subheader("📋 Detailed Holdings & Management")
     
