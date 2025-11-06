@@ -1,7 +1,13 @@
+# modified file: ai-stock-analyst-blockchain/streamlit_app/stock_advisor_finnhub.py
+
 """
 Stock Analysis Module - Finnhub Version
 AI-powered stock analysis with Finnhub API
 Complete professional implementation with full AI analysis
+
+**MODIFIED** to include:
+- get_popular_stocks_analysis: For AI budgeter candidate generation.
+- get_stock_quote_batch: For efficient pricing of candidate lists.
 """
 
 
@@ -11,6 +17,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from fuzzywuzzy import fuzz, process
 import warnings
+import time # Added for robust API call handling
 
 warnings.filterwarnings('ignore')
 
@@ -37,6 +44,19 @@ class StockAdvisorFinnhub:
             'home depot': 'HD', 'mcdonalds': 'MCD', 'nike': 'NKE',
             'starbucks': 'SBUX', 'coca cola': 'KO', 'pepsi': 'PEP'
         }
+        
+        # --- NEW: Stock universe for AI Budgeter ---
+        # Based on the hard-coded lists in 1_📊_Stock_Analysis.py
+        self.ai_budgeter_stock_universe = {
+            'AAPL': 'Technology', 'MSFT': 'Technology', 'GOOGL': 'Technology',
+            'TSLA': 'Consumer Cyclical', 'NVDA': 'Technology', 'AMZN': 'Consumer Cyclical',
+            'JPM': 'Financial', 'BAC': 'Financial', 'META': 'Technology',
+            'NFLX': 'Communication Services', 'AMD': 'Technology', 'INTC': 'Technology',
+            'JNJ': 'Healthcare', 'PFE': 'Healthcare', 'UNH': 'Healthcare',
+            'XOM': 'Energy', 'CVX': 'Energy', 'COST': 'Consumer Defensive',
+            'WMT': 'Consumer Defensive', 'MCD': 'Consumer Cyclical'
+        }
+
     
     def smart_symbol_lookup(self, company_query: str) -> str:
         """Fuzzy match company name to stock symbol"""
@@ -297,8 +317,7 @@ class StockAdvisorFinnhub:
 
 ### 🤖 AI Recommendation (Real-Time Analysis)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-**Recommendation:** {rec_emoji} **{recommendation}**  
-**AI Confidence:** {confidence}%  
+**Recommendation:** {rec_emoji} **{recommendation}** **AI Confidence:** {confidence}%  
 **Analysis:** {reason}
 
 **Price Position:** {price_position*100:.1f}% from day's low  
@@ -423,8 +442,7 @@ is based on real-time market action and price momentum.
 
 ### 🤖 AI Recommendation (Technical + Fundamental)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-**Recommendation:** {rec_emoji} **{recommendation}**  
-**AI Confidence:** {confidence}%  
+**Recommendation:** {rec_emoji} **{recommendation}** **AI Confidence:** {confidence}%  
 **Analysis Depth:** Full Technical Analysis ({len(data)} days of data)
 
 ### 📊 Technical Indicators
@@ -514,3 +532,126 @@ is based on real-time market action and price momentum.
             return quote['price'] if quote else 0.0
         except:
             return 0.0
+
+    # --- NEW FUNCTIONS FOR AI BUDGETER ---
+
+    def get_popular_stocks_analysis(self, progress_callback=None) -> list:
+        """
+        Fetches analyst ratings and price targets for the predefined
+        stock universe. This builds the "candidate pool" for the AI budgeter.
+        
+        Args:
+            progress_callback: A function (like st.progress) to report progress.
+        
+        Returns:
+            A list of candidate stock dictionaries with full analysis.
+        """
+        
+        candidates = []
+        total_stocks = len(self.ai_budgeter_stock_universe)
+        
+        for i, (symbol, sector) in enumerate(self.ai_budgeter_stock_universe.items()):
+            try:
+                if progress_callback:
+                    progress_callback(
+                        (i + 1) / total_stocks, 
+                        text=f"Analyzing candidate {symbol} ({i+1}/{total_stocks})..."
+                    )
+                
+                # 1. Get Recommendation Trends
+                # This is the "predicted data" from analysts
+                recs = self.client.recommendation_trends(symbol)
+                if not recs:
+                    print(f"No recommendations found for {symbol}")
+                    continue
+                
+                # 2. Get Price Targets
+                # This is the "predicted price data"
+                target = self.client.price_target(symbol)
+                if not target or not target.get('targetMean'):
+                    print(f"No price target found for {symbol}")
+                    continue
+                
+                # 3. Get Current Quote (for upside calculation)
+                quote = self.get_stock_quote(symbol)
+                if not quote or not quote.get('price'):
+                    print(f"No quote found for {symbol}")
+                    continue
+
+                # We need the most recent data
+                latest_rec = recs[0]
+                current_price = quote['price']
+                target_price = target.get('targetMean', 0)
+                
+                # Calculate upside
+                upside_pct = 0
+                if current_price > 0 and target_price > current_price:
+                    upside_pct = ((target_price - current_price) / current_price) * 100
+                
+                # Define a combined score for "Buy" conviction
+                buy_score = (latest_rec['strongBuy'] * 2) + latest_rec['buy']
+                sell_score = (latest_rec['strongSell'] * 2) + latest_rec['sell']
+                
+                # Only add stocks with a positive outlook and valid data
+                if (buy_score > sell_score) and (upside_pct > 0):
+                    candidates.append({
+                        'symbol': symbol,
+                        'sector': sector,
+                        'buy_score': buy_score,
+                        'strongBuy': latest_rec['strongBuy'],
+                        'buy': latest_rec['buy'],
+                        'hold': latest_rec['hold'],
+                        'sell': latest_rec['sell'],
+                        'strongSell': latest_rec['strongSell'],
+                        'targetMean': target_price,
+                        'current_price': current_price,
+                        'upside_pct': upside_pct
+                    })
+                
+                # Finnhub free tier has a 60 calls/minute limit.
+                # Each symbol makes 3 calls. 20 symbols * 3 = 60 calls.
+                # We add a small, robust delay to ensure we stay under the limit.
+                time.sleep(1.1) # 60 seconds / 60 calls = 1 sec/call. 1.1s is safer.
+
+            except Exception as e:
+                # Log error but continue analysis for other stocks
+                print(f"AI Budgeter: Error fetching data for {symbol}: {e}")
+                # We still sleep to avoid cascading failures
+                time.sleep(1.1) 
+        
+        if progress_callback:
+            progress_callback(1.0, text="Market analysis complete.")
+            
+        return candidates
+
+    def get_stock_quote_batch(self, symbols_list: list) -> dict:
+        """
+        Gets current prices for a list of stock symbols.
+        The Finnhub client doesn't support batch quotes, so this
+        function robustly iterates and calls the single quote function.
+        
+        Args:
+            symbols_list: A list of stock symbols (e.g., ['AAPL', 'MSFT'])
+        
+        Returns:
+            A dictionary of {symbol: price}
+        """
+        quotes = {}
+        for symbol in symbols_list:
+            try:
+                # Use the existing robust get_stock_quote function
+                quote_data = self.get_stock_quote(symbol)
+                
+                if quote_data and quote_data['price'] > 0:
+                    quotes[symbol] = quote_data['price']
+                else:
+                    quotes[symbol] = 0.0 # Mark as invalid
+                
+                # Add a tiny delay to respect API limits
+                time.sleep(0.5) 
+                
+            except Exception as e:
+                print(f"Batch Quote: Error fetching {symbol}: {e}")
+                quotes[symbol] = 0.0
+                
+        return quotes

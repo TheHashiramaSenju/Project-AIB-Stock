@@ -1,4 +1,3 @@
-# new file: ai-stock-analyst-blockchain/streamlit_app/pages/4_🤖_AI_Budgeting.py
 
 """
 AI Portfolio Budgeter - New Feature Page
