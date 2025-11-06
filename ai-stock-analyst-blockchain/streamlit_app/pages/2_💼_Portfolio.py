@@ -1,7 +1,4 @@
 # modified file: ai-stock-analyst-blockchain/streamlit_app/pages/2_💼_Portfolio.py
-# FIXES APPLIED:
-# 1. Fixed `UnhashableParamError` by changing `generate_portfolio_charts(advisor)` to `generate_portfolio_charts(_advisor)`
-# 2. Fixed `too many values to unpack` by correctly handling the string response from `add_investment_blockchain`
 
 import streamlit as st
 import sys
@@ -107,7 +104,7 @@ init_session_state()
 
 # --- Helper Function for Visualization ---
 #
-# ✅ --- FIX 1 ---
+# ✅ --- FIX 1 (Definition) ---
 # Renamed `advisor` to `_advisor` to fix the `UnhashableParamError`.
 # The leading underscore tells Streamlit's caching to ignore this argument.
 #
@@ -141,6 +138,8 @@ def generate_portfolio_charts(portfolio_data, _advisor):
             # Use `_advisor` internally now
             profile = _advisor.get_company_profile(symbol)
             sector = profile.get('finnhubIndustry', 'Other')
+            if not sector or sector == "":
+                sector = "Other"
         except Exception:
             sector = 'Other'
 
@@ -380,8 +379,9 @@ else:
     
     with st.spinner("Generating portfolio charts..."):
         #
-        # ✅ --- FIX 1 (call) ---
+        # ✅ --- FIX 1 (Call) ---
         # Pass the advisor object using the `_advisor=` kwarg.
+        # This tells Streamlit to ignore this unhashable argument.
         #
         pie_stock_fig, pie_sector_fig, bar_fig = generate_portfolio_charts(
             portfolio, 

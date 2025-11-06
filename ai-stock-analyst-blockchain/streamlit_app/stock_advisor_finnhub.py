@@ -5,9 +5,10 @@ Stock Analysis Module - Finnhub Version
 AI-powered stock analysis with Finnhub API
 Complete professional implementation with full AI analysis
 
-**MODIFIED** to include:
-- get_popular_stocks_analysis: For AI budgeter candidate generation.
-- get_stock_quote_batch: For efficient pricing of candidate lists.
+**MODIFIED (v2.0 - Free Fix):**
+- get_popular_stocks_analysis: Rewritten to use FREE technical indicators
+  (RSI, MACD, SMA) instead of paid analyst data to fix 403 errors.
+- get_stock_quote_batch: Kept for efficient pricing.
 """
 
 
@@ -17,7 +18,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from fuzzywuzzy import fuzz, process
 import warnings
-import time # Added for robust API call handling
+import time # For robust API call handling
 
 warnings.filterwarnings('ignore')
 
@@ -29,6 +30,7 @@ class StockAdvisorFinnhub:
         self.api_key = api_key
         self.client = finnhub.Client(api_key=api_key)
         
+        # Original symbol lookup map
         self.company_symbols = {
             'apple': 'AAPL', 'microsoft': 'MSFT', 'google': 'GOOGL', 
             'alphabet': 'GOOGL', 'amazon': 'AMZN', 'tesla': 'TSLA',
@@ -45,8 +47,8 @@ class StockAdvisorFinnhub:
             'starbucks': 'SBUX', 'coca cola': 'KO', 'pepsi': 'PEP'
         }
         
-        # --- NEW: Stock universe for AI Budgeter ---
-        # Based on the hard-coded lists in 1_📊_Stock_Analysis.py
+        # This is our "analysis universe" - a set of well-known, liquid stocks.
+        # The AI will pick from this list.
         self.ai_budgeter_stock_universe = {
             'AAPL': 'Technology', 'MSFT': 'Technology', 'GOOGL': 'Technology',
             'TSLA': 'Consumer Cyclical', 'NVDA': 'Technology', 'AMZN': 'Consumer Cyclical',
@@ -157,6 +159,7 @@ class StockAdvisorFinnhub:
             exp2 = df['Close'].ewm(span=26, adjust=False).mean()
             df['MACD'] = exp1 - exp2
             df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+            df['MACD_Hist'] = df['MACD'] - df['Signal'] # MACD Histogram
             
             # Bollinger Bands
             df['BB_Middle'] = df['Close'].rolling(window=20).mean()
@@ -440,7 +443,7 @@ is based on real-time market action and price momentum.
 **52-Week Low:** ${year_low:.2f}  
 **Day Range:** ${quote['low']:.2f} - ${quote['high']:.2f}
 
-### 🤖 AI Recommendation (Technical + Fundamental)
+### 🤖 AI Recommendation (Technical Analysis)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 **Recommendation:** {rec_emoji} **{recommendation}** **AI Confidence:** {confidence}%  
 **Analysis Depth:** Full Technical Analysis ({len(data)} days of data)
@@ -533,95 +536,101 @@ is based on real-time market action and price momentum.
         except:
             return 0.0
 
-    # --- NEW FUNCTIONS FOR AI BUDGETER ---
-
+    # ---
+    # --- NEW FUNCTION FOR AI BUDGETER (FREE VERSION) ---
+    # ---
+    
     def get_popular_stocks_analysis(self, progress_callback=None) -> list:
         """
-        Fetches analyst ratings and price targets for the predefined
-        stock universe. This builds the "candidate pool" for the AI budgeter.
+        Fetches FREE technical indicator data for the predefined
+        stock universe. This builds the "candidate pool" for the new AI budgeter.
+        
+        This function is INTENTIONALLY SLOW to respect the Finnhub free tier
+        limit of 60 calls/minute. It will take ~2-3 minutes to run.
         
         Args:
             progress_callback: A function (like st.progress) to report progress.
         
         Returns:
-            A list of candidate stock dictionaries with full analysis.
+            A list of candidate stock dictionaries with technical data.
         """
         
         candidates = []
         total_stocks = len(self.ai_budgeter_stock_universe)
+        print(f"AI Budgeter (Free): Starting technical analysis for {total_stocks} stocks.")
         
         for i, (symbol, sector) in enumerate(self.ai_budgeter_stock_universe.items()):
             try:
                 if progress_callback:
                     progress_callback(
                         (i + 1) / total_stocks, 
-                        text=f"Analyzing candidate {symbol} ({i+1}/{total_stocks})..."
+                        text=f"Analyzing {symbol} ({i+1}/{total_stocks})... Fetching 1yr data."
                     )
                 
-                # 1. Get Recommendation Trends
-                # This is the "predicted data" from analysts
-                recs = self.client.recommendation_trends(symbol)
-                if not recs:
-                    print(f"No recommendations found for {symbol}")
+                # 1. Get 1 Year of FREE Historical Data
+                # This is our main data pull.
+                data = self.get_stock_data(symbol, days=365)
+                if data is None or data.empty or len(data) < 200: # Need enough data
+                    print(f"AI Budgeter: Skipping {symbol}, insufficient historical data.")
+                    time.sleep(1.1) # Still sleep to respect rate limit
                     continue
                 
-                # 2. Get Price Targets
-                # This is the "predicted price data"
-                target = self.client.price_target(symbol)
-                if not target or not target.get('targetMean'):
-                    print(f"No price target found for {symbol}")
-                    continue
+                # 2. Calculate FREE Technical Indicators
+                df = self.calculate_technical_indicators(data)
+                latest = df.iloc[-1]
                 
-                # 3. Get Current Quote (for upside calculation)
+                # 3. Get FREE Current Quote
                 quote = self.get_stock_quote(symbol)
                 if not quote or not quote.get('price'):
-                    print(f"No quote found for {symbol}")
+                    print(f"AI Budgeter: Skipping {symbol}, could not get live quote.")
+                    time.sleep(1.1)
                     continue
 
-                # We need the most recent data
-                latest_rec = recs[0]
-                current_price = quote['price']
-                target_price = target.get('targetMean', 0)
+                # 4. Get FREE Company Profile
+                profile = self.get_company_profile(symbol)
+                finnhub_sector = profile.get('finnhubIndustry', 'Other')
+                if not finnhub_sector or finnhub_sector == "":
+                    finnhub_sector = "Other"
                 
-                # Calculate upside
-                upside_pct = 0
-                if current_price > 0 and target_price > current_price:
-                    upside_pct = ((target_price - current_price) / current_price) * 100
-                
-                # Define a combined score for "Buy" conviction
-                buy_score = (latest_rec['strongBuy'] * 2) + latest_rec['buy']
-                sell_score = (latest_rec['strongSell'] * 2) + latest_rec['sell']
-                
-                # Only add stocks with a positive outlook and valid data
-                if (buy_score > sell_score) and (upside_pct > 0):
+                # 5. Compile all FREE data into a candidate dictionary
+                # We check for NaN values to ensure data is clean.
+                if pd.notna(latest['RSI']) and pd.notna(latest['MACD_Hist']) and pd.notna(latest['SMA_50']):
                     candidates.append({
                         'symbol': symbol,
-                        'sector': sector,
-                        'buy_score': buy_score,
-                        'strongBuy': latest_rec['strongBuy'],
-                        'buy': latest_rec['buy'],
-                        'hold': latest_rec['hold'],
-                        'sell': latest_rec['sell'],
-                        'strongSell': latest_rec['strongSell'],
-                        'targetMean': target_price,
-                        'current_price': current_price,
-                        'upside_pct': upside_pct
+                        'sector': finnhub_sector,
+                        'current_price': quote['price'],
+                        'rsi': latest['RSI'],
+                        'macd_hist': latest['MACD_Hist'], # Histogram (MACD - Signal)
+                        'sma_50': latest['SMA_50'],
+                        'sma_200': latest['SMA_200'],
+                        'price_vs_sma50': ((quote['price'] - latest['SMA_50']) / latest['SMA_50']) * 100
                     })
                 
                 # Finnhub free tier has a 60 calls/minute limit.
-                # Each symbol makes 3 calls. 20 symbols * 3 = 60 calls.
-                # We add a small, robust delay to ensure we stay under the limit.
-                time.sleep(1.1) # 60 seconds / 60 calls = 1 sec/call. 1.1s is safer.
+                # This loop makes 3 calls: get_stock_data, get_stock_quote, get_company_profile.
+                # To be robust, we MUST sleep to avoid 429 (Too Many Requests) errors.
+                # 3 calls/stock * 20 stocks = 60 calls. We need ~1 sec per call.
+                # (1.1s * 3 calls/stock) = 3.3s per stock.
+                # Total runtime: ~ 3.3s * 20 stocks = ~66 seconds. This is robust.
+                time.sleep(1.1) # Sleep after get_stock_data
+                time.sleep(1.1) # Sleep after get_stock_quote
+                time.sleep(1.1) # Sleep after get_company_profile
 
             except Exception as e:
                 # Log error but continue analysis for other stocks
-                print(f"AI Budgeter: Error fetching data for {symbol}: {e}")
-                # We still sleep to avoid cascading failures
-                time.sleep(1.1) 
+                print(f"AI Budgeter (Free): Error processing {symbol}: {e}")
+                if "429" in str(e): # Hit rate limit
+                    print("AI Budgeter: Hit rate limit. Sleeping for 30 seconds.")
+                    if progress_callback:
+                        progress_callback((i + 1) / total_stocks, text=f"Rate limit hit. Pausing for 30s...")
+                    time.sleep(30)
+                else:
+                    time.sleep(1.1) # Sleep anyway
         
         if progress_callback:
-            progress_callback(1.0, text="Market analysis complete.")
+            progress_callback(1.0, text="Market technical analysis complete.")
             
+        print(f"AI Budgeter (Free): Completed analysis. Found {len(candidates)} valid candidates.")
         return candidates
 
     def get_stock_quote_batch(self, symbols_list: list) -> dict:
@@ -647,11 +656,14 @@ is based on real-time market action and price momentum.
                 else:
                     quotes[symbol] = 0.0 # Mark as invalid
                 
-                # Add a tiny delay to respect API limits
-                time.sleep(0.5) 
+                # Add a delay to respect API limits (60 calls/min)
+                time.sleep(1.1) 
                 
             except Exception as e:
                 print(f"Batch Quote: Error fetching {symbol}: {e}")
                 quotes[symbol] = 0.0
+                if "429" in str(e):
+                    print("Batch Quote: Hit rate limit. Sleeping for 30 seconds.")
+                    time.sleep(30)
                 
         return quotes
