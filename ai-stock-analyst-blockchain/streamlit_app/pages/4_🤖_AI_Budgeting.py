@@ -4,7 +4,7 @@ AI Portfolio Budgeter - Alpha Vantage Edition (2-Stock Optimized)
 This page allows a user to input a budget and risk profile, and receive
 a fully-allocated investment plan based on AI analysis using Alpha Vantage.
 
-OPTIMIZED FOR FREE TIER: Only 2 stocks = 2 API calls (out of 25/day limit)
+OPTIMIZED FOR FREE TIER: Only All stocks (2 for now) = 2 API calls (out of 25/day limit)
 
 Features:
 - Uses Alpha Vantage for technical analysis (RSI, MACD, trend analysis)
@@ -382,7 +382,7 @@ def check_api_health(api_key: str) -> Dict[str, Any]:
 @st.cache_data(ttl=3600)
 def get_stock_candidates(_advisor: StockAdvisorAlphaVantage) -> Tuple[List[Dict], str]:
     """
-    Analyzes 2 stocks with comprehensive error handling.
+    Analyzes All stocks (2 for now) with comprehensive error handling.
     
     Args:
         _advisor: StockAdvisorAlphaVantage instance
@@ -693,7 +693,7 @@ if generate_btn:
         logger.error("Preflight check failed: Advisor not initialized")
         st.stop()
     
-    with st.spinner(f"🤖 **Analyzing 2 stocks...** Generating a '{risk_profile}' plan for **${budget:,.2f}**..."):
+    with st.spinner(f"🤖 **Analyzing All stocks (2 for now)...** Generating a '{risk_profile}' plan for **${budget:,.2f}**..."):
         try:
             # Get candidates
             logger.info("Fetching stock candidates...")
