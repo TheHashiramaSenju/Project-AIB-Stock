@@ -24,12 +24,11 @@ from datetime import datetime
 import time
 from typing import Tuple, List, Dict, Optional
 
-# --- Path Setup ---
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 try:
-    from stock_advisor_alphavantage import StockAdvisorAlphaVantage
-    from ai_budgeter import AIBudgeter
+    from stock_advisor_alphavantage import StockAdvisorAlphaVantage  # CHANGED
+    from ai_budgeter import AIBudgeter  # ADDED
     from portfolio_manager import BlockchainPortfolioManagerEnhanced
     from blockchain_integration import BlockchainPortfolioManager
 except ImportError as e:
@@ -37,7 +36,6 @@ except ImportError as e:
     st.error("Could not import required modules. Ensure all files are in the `streamlit_app` directory.")
     st.stop()
 
-# --- Page Configuration ---
 st.set_page_config(
     page_title="AI Budgeting - AI Stock Analyst",
     page_icon="🤖",
@@ -45,7 +43,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Custom CSS ---
+
 st.markdown("""
 <style>
     .main-header {
@@ -94,7 +92,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Session State Initialization ---
 def init_session_state():
     """Initialize all session state variables"""
     
