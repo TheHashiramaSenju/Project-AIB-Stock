@@ -11,9 +11,10 @@ Features:
 - Generates a diversified plan based on risk profile
 - Allows one-click saving of the entire plan to the blockchain portfolio
 - Full integration with existing portfolio management system
+- Enhanced error handling and diagnostics
 
 Author: Bhoomika M
-Date: 2025-11-07
+Date: 2025-11-08
 """
 
 import streamlit as st
@@ -23,17 +24,23 @@ import pandas as pd
 from datetime import datetime
 import time
 from typing import Tuple, List, Dict, Optional
+import requests
 
+# --- Path Setup ---
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 try:
-    from stock_advisor_alphavantage import StockAdvisorAlphaVantage  # CHANGED
-    from ai_budgeter import AIBudgeter  # ADDED
+    from stock_advisor_alphavantage import StockAdvisorAlphaVantage
+    from ai_budgeter import AIBudgeter
     from portfolio_manager import BlockchainPortfolioManagerEnhanced
     from blockchain_integration import BlockchainPortfolioManager
 except ImportError as e:
     st.error(f"**Import Error:** {e}")
     st.error("Could not import required modules. Ensure all files are in the `streamlit_app` directory.")
+    st.error("**Required files in streamlit_app/:**")
+    st.error("- stock_advisor_alphavantage.py")
+    st.error("- ai_budgeter.py")
+    st.error("- portfolio_manager.py")
     st.stop()
 
 st.set_page_config(
@@ -42,7 +49,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
 
 st.markdown("""
 <style>
@@ -89,23 +95,48 @@ st.markdown("""
         font-weight: 600;
         font-size: 1.1rem;
     }
+    
+    .debug-box {
+        background: #f0f0f0;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #ff7f0e;
+        font-family: monospace;
+        font-size: 0.85rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
+# --- Session State Initialization ---
 def init_session_state():
     """Initialize all session state variables"""
     
+    # Alpha Vantage API Key
     if 'alpha_vantage_key' not in st.session_state:
-        st.session_state.alpha_vantage_key = st.secrets.get("ALPHA_VANTAGE_API_KEY", "ZRBAZ10IY283K3T7")
+        api_key = st.secrets.get("ALPHA_VANTAGE_API_KEY", "ZRBAZ10IY283K3T7")
+        st.session_state.alpha_vantage_key = api_key
+        st.session_state.api_key_source = "secrets" if api_key else "default"
     
+    # Initialize advisor with error handling
     if 'advisor' not in st.session_state:
-        st.session_state.advisor = StockAdvisorAlphaVantage(st.session_state.alpha_vantage_key)
+        try:
+            st.session_state.advisor = StockAdvisorAlphaVantage(st.session_state.alpha_vantage_key)
+            st.session_state.advisor_initialized = True
+        except Exception as e:
+            st.session_state.advisor = None
+            st.session_state.advisor_initialized = False
+            st.session_state.advisor_error = str(e)
     
+    # Initialize portfolio manager
     if 'portfolio_manager' not in st.session_state:
-        st.session_state.portfolio_manager = BlockchainPortfolioManagerEnhanced(
-            blockchain_enabled=True
-        )
-        st.session_state.portfolio_manager.set_stock_advisor(st.session_state.advisor)
+        try:
+            st.session_state.portfolio_manager = BlockchainPortfolioManagerEnhanced(
+                blockchain_enabled=True
+            )
+            st.session_state.portfolio_manager.set_stock_advisor(st.session_state.advisor)
+        except Exception as e:
+            st.session_state.portfolio_manager = None
+            print(f"Portfolio manager error: {e}")
     
     if 'wallet_connected' not in st.session_state:
         st.session_state.wallet_connected = False
@@ -124,31 +155,87 @@ def init_session_state():
 
 init_session_state()
 
+# --- API Health Check Function ---
+def check_api_health(api_key: str) -> Dict[str, any]:
+    """
+    Tests Alpha Vantage API connectivity.
+    
+    Returns:
+        Dict with status, message, and remaining calls info
+    """
+    try:
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "GLOBAL_QUOTE",
+            "symbol": "AAPL",
+            "apikey": api_key
+        }
+        
+        response = requests.get(url, params=params, timeout=5)
+        data = response.json()
+        
+        # Check for various error responses
+        if "Error Message" in data:
+            return {
+                "status": "error",
+                "message": f"API Error: {data['Error Message']}",
+                "details": "Invalid API key or API error"
+            }
+        
+        if "Note" in data:
+            return {
+                "status": "rate_limited",
+                "message": "Rate limit reached",
+                "details": data['Note']
+            }
+        
+        if "Global Quote" in data and data["Global Quote"]:
+            return {
+                "status": "success",
+                "message": "API is working correctly",
+                "details": f"Successfully retrieved AAPL quote"
+            }
+        
+        return {
+            "status": "unknown",
+            "message": "Unexpected API response",
+            "details": str(data)
+        }
+        
+    except requests.exceptions.Timeout:
+        return {
+            "status": "error",
+            "message": "API request timeout",
+            "details": "Alpha Vantage server is not responding"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Connection error: {str(e)}",
+            "details": "Cannot reach Alpha Vantage API"
+        }
+
 # --- AI BUDGETING LOGIC (ONLY 2 STOCKS) ---
 
 @st.cache_data(ttl=3600)
-def get_stock_candidates(_advisor: StockAdvisorAlphaVantage) -> list:
+def get_stock_candidates(_advisor: StockAdvisorAlphaVantage) -> Tuple[list, str]:
     """
     OPTIMIZED FOR FREE TIER: Analyzes only 2 stocks.
     
-    Alpha Vantage Free Tier: 25 API calls/day limit
-    This app uses: 1 API call × 2 stocks = 2 calls total
-    WELL under the 25 call limit!
-    
-    Args:
-        _advisor: The initialized StockAdvisorAlphaVantage instance.
-        
     Returns:
-        A list of 2 candidate stock dictionaries with technical data.
+        Tuple of (candidates_list, error_message or empty_string)
     """
     
-    # ===== ONLY 2 STOCKS =====
+    if _advisor is None:
+        return [], "Advisor not initialized. Check API key configuration."
+    
     stock_universe = {
         'AAPL': 'Technology',
         'MSFT': 'Technology'
     }
     
     candidates = []
+    errors = []
     progress_bar = st.progress(0, text="Analyzing market candidates...")
     
     total_stocks = len(stock_universe)
@@ -160,11 +247,22 @@ def get_stock_candidates(_advisor: StockAdvisorAlphaVantage) -> list:
                 text=f"Analyzing {symbol} ({i+1}/{total_stocks})..."
             )
             
-            # Get technical analysis (1 API call per stock)
+            print(f"[DEBUG] Analyzing {symbol}...")
+            
+            # Get technical analysis
             analysis = _advisor.analyze_stock_technical(symbol)
             
             if not analysis:
-                print(f"Warning: Could not analyze {symbol}")
+                error_msg = f"No data returned for {symbol}"
+                errors.append(error_msg)
+                print(f"[WARNING] {error_msg}")
+                continue
+            
+            # Validate analysis data
+            if 'price' not in analysis or analysis['price'] <= 0:
+                error_msg = f"Invalid price data for {symbol}: {analysis.get('price', 'N/A')}"
+                errors.append(error_msg)
+                print(f"[WARNING] {error_msg}")
                 continue
             
             candidates.append({
@@ -172,68 +270,104 @@ def get_stock_candidates(_advisor: StockAdvisorAlphaVantage) -> list:
                 'name': symbol,
                 'sector': sector,
                 'price': analysis['price'],
-                'change_percent': analysis['change_percent'],
-                'rsi': analysis['rsi'],
-                'macd_signal': analysis['macd_signal'],
-                'trend': analysis['trend'],
-                'recommendation': analysis['recommendation'],
-                'volume': analysis['volume'],
+                'change_percent': analysis.get('change_percent', '0%'),
+                'rsi': analysis.get('rsi'),
+                'macd_signal': analysis.get('macd_signal', 'HOLD'),
+                'trend': analysis.get('trend', 'NEUTRAL'),
+                'recommendation': analysis.get('recommendation', 'HOLD'),
+                'volume': analysis.get('volume', 0),
                 'high': analysis.get('high', 0),
                 'low': analysis.get('low', 0),
                 'change': analysis.get('change', 0)
             })
             
-            # Small delay (not necessary with 2 stocks, but good practice)
+            print(f"[SUCCESS] {symbol} analyzed successfully")
+            
             if i < total_stocks - 1:
                 time.sleep(2)
             
         except Exception as e:
-            print(f"Error fetching candidate data for {symbol}: {e}")
+            error_msg = f"Error analyzing {symbol}: {str(e)}"
+            errors.append(error_msg)
+            print(f"[ERROR] {error_msg}")
     
     progress_bar.empty()
     
-    if len(candidates) > 0:
-        st.success(f"✅ Successfully analyzed {len(candidates)} stocks (API calls: {len(candidates)}/25)")
-    else:
-        st.error("❌ Failed to analyze any stocks")
-    
-    return candidates
+    # Return results with error info
+    error_text = "\n".join(errors) if errors else ""
+    return candidates, error_text
 
 
 def generate_investment_plan(budget: float, risk_profile: str, 
                             candidates: list, advisor: StockAdvisorAlphaVantage) -> Tuple[Optional[list], Optional[str]]:
     """
     Generates a diversified portfolio plan based on technical analysis.
-    
-    Args:
-        budget: Total user budget.
-        risk_profile: 'Conservative', 'Moderate', or 'Aggressive'.
-        candidates: List of analyzed stocks (2 stocks).
-        advisor: StockAdvisorAlphaVantage instance.
-        
-    Returns:
-        Tuple of (final_plan, error_message)
     """
     if not candidates:
-        return None, "Error: Could not fetch stock candidates. Check your API key."
+        return None, "No stock candidates available for analysis."
     
-    budgeter = AIBudgeter()
-    budgeter.set_verbose(True)
-    
-    plan, error = budgeter.generate_investment_plan(budget, risk_profile, candidates)
-    
-    if error:
-        return None, error
-    
-    if not plan:
-        return None, "Error: Plan generation failed."
-    
-    for item in plan:
-        item['sector'] = item.get('sector', 'Unknown')
-    
-    return plan, None
+    try:
+        budgeter = AIBudgeter()
+        budgeter.set_verbose(True)
+        
+        plan, error = budgeter.generate_investment_plan(budget, risk_profile, candidates)
+        
+        if error:
+            return None, error
+        
+        if not plan:
+            return None, "Plan generation returned no results."
+        
+        # Add sector information
+        for item in plan:
+            item['sector'] = item.get('sector', 'Unknown')
+        
+        return plan, None
+        
+    except Exception as e:
+        return None, f"Plan generation error: {str(e)}"
 
 # --- PAGE UI ---
+
+# Diagnostic Section (Top)
+with st.expander("🔧 **System Diagnostics** (Click to expand)", expanded=False):
+    st.markdown("### Alpha Vantage Configuration Check")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**API Key Status:**")
+        if st.session_state.alpha_vantage_key:
+            st.write(f"- Source: {st.session_state.api_key_source}")
+            st.write(f"- Key: `{st.session_state.alpha_vantage_key[:10]}...`")
+        else:
+            st.error("❌ No API key configured!")
+    
+    with col2:
+        st.write("**Advisor Status:**")
+        if st.session_state.advisor_initialized:
+            st.success("✅ Advisor initialized")
+        else:
+            st.error(f"❌ Advisor error: {st.session_state.get('advisor_error', 'Unknown')}")
+    
+    # API Health Check
+    st.markdown("---")
+    st.write("**Quick API Test:**")
+    
+    if st.button("🧪 Test API Connection"):
+        with st.spinner("Testing API..."):
+            health = check_api_health(st.session_state.alpha_vantage_key)
+            
+            if health['status'] == 'success':
+                st.success(f"✅ {health['message']}")
+                st.info(health['details'])
+            elif health['status'] == 'rate_limited':
+                st.warning(f"⚠️ {health['message']}")
+                st.info(health['details'])
+            else:
+                st.error(f"❌ {health['message']}")
+                st.error(health['details'])
+
 st.markdown("""
 <div class="info-box">
     <h3>🤖 AI Portfolio Budgeter (Optimized)</h3>
@@ -278,15 +412,36 @@ st.divider()
 if generate_btn:
     st.session_state.generated_plan = None
     
+    # Check prerequisites
+    if not st.session_state.advisor_initialized:
+        st.error("❌ API Not Configured")
+        st.error("Advisor failed to initialize. Check your Alpha Vantage API key in `.streamlit/secrets.toml`")
+        st.stop()
+    
     with st.spinner(f"🤖 **Analyzing 2 stocks...** Generating a '{risk_profile}' plan for **${budget:,.2f}**..."):
         try:
-            candidates = get_stock_candidates(st.session_state.advisor)
+            # Get candidates with error tracking
+            candidates, analysis_errors = get_stock_candidates(st.session_state.advisor)
             
-            if not candidates:
-                st.error("❌ Could not analyze stocks. Check your API key and try again.")
-                st.info("💡 **Tip:** Free tier has 25 calls/day limit. Wait until tomorrow if depleted.")
+            # Show analysis errors if any
+            if analysis_errors:
+                with st.expander("⚠️ Analysis Warnings", expanded=True):
+                    st.write(analysis_errors)
+            
+            # Check if we have candidates
+            if not candidates or len(candidates) == 0:
+                st.error("❌ Could not analyze any stocks")
+                st.error("**Possible causes:**")
+                st.error("1. Invalid API key")
+                st.error("2. API rate limit exceeded (25 calls/day)")
+                st.error("3. Alpha Vantage server down")
+                st.error("4. Network connectivity issue")
+                st.info("💡 **Solution:** Check diagnostics above, wait 60 seconds, and try again")
                 st.stop()
             
+            st.success(f"✅ Successfully analyzed {len(candidates)} stocks")
+            
+            # Generate plan
             plan, error = generate_investment_plan(
                 budget, 
                 risk_profile, 
@@ -295,16 +450,20 @@ if generate_btn:
             )
             
             if error:
-                st.error(f"**AI Plan Generation Failed:** {error}")
+                st.error(f"**AI Plan Generation Failed:**")
+                st.error(error)
+                st.info("Try selecting a different risk profile or adjusting your budget")
             elif plan:
                 st.session_state.generated_plan = plan
                 st.success(f"✅ AI Investment Plan Generated Successfully for {len(plan)} stocks!")
             else:
-                st.error("❌ An unknown error occurred.")
+                st.error("❌ An unknown error occurred during plan generation")
                 
         except Exception as e:
-            st.error(f"An unexpected error occurred: {e}")
+            st.error(f"❌ Unexpected error: {str(e)}")
             st.exception(e)
+            with st.expander("📋 Detailed Error Info"):
+                st.code(str(e))
 
 # --- Display the generated plan ---
 if st.session_state.generated_plan:
@@ -375,6 +534,10 @@ if st.session_state.generated_plan:
     )
     
     if save_plan_btn:
+        if st.session_state.portfolio_manager is None:
+            st.error("Portfolio manager not initialized")
+            st.stop()
+        
         st.info(f"**Executing Plan...** Saving {len(plan)} investments to blockchain.")
         progress_bar = st.progress(0, text="Initializing...")
         
@@ -416,6 +579,29 @@ if st.session_state.generated_plan:
 st.divider()
 
 # --- Educational Expanders ---
+with st.expander("📚 Troubleshooting", expanded=False):
+    st.markdown("""
+    ### Common Issues & Solutions:
+    
+    **❌ "Failed to analyze any stocks"**
+    - Check API key in `.streamlit/secrets.toml`
+    - Run the API test in Diagnostics
+    - Check if daily 25-call limit is exceeded
+    
+    **❌ "Rate limit reached"**
+    - Free tier: 5 calls/minute, 25 calls/day
+    - Solution: Wait 60 seconds or until next day (UTC midnight)
+    
+    **❌ "Could not fetch stock candidates"**
+    - Network connectivity issue
+    - Alpha Vantage server down
+    - Try again in a few moments
+    
+    **✅ Still having issues?**
+    - Click "System Diagnostics" tab above
+    - Check console logs for detailed error messages
+    """)
+
 with st.expander("📚 Why Only 2 Stocks?", expanded=False):
     st.markdown("""
     ### Alpha Vantage Free Tier Limits:
@@ -428,11 +614,6 @@ with st.expander("📚 Why Only 2 Stocks?", expanded=False):
     - **100% under rate limit** (2 out of 5/minute)
     - **No waiting** = Instant results
     - **Premium stocks** = AAPL + MSFT (highest quality)
-    
-    ### Result:
-    ✅ **Zero rate limiting issues**
-    ✅ **Fast execution**
-    ✅ **Reliable every time**
     """)
 
 with st.expander("❓ How does the AI work?"):
@@ -443,16 +624,4 @@ with st.expander("❓ How does the AI work?"):
     2. **Score:** Calculate 0-100 technical score
     3. **Filter:** Apply risk profile criteria
     4. **Allocate:** Distribute budget optimally
-    
-    **All within free tier limits!**
-    """)
-
-with st.expander("🔑 API Usage"):
-    st.markdown(f"""
-    ### Alpha Vantage Status:
-    - **API Key:** {"✅ Connected" if st.session_state.alpha_vantage_key else "❌ Not configured"}
-    - **Free Tier:** 25 calls/day
-    - **This Run:** 2 calls
-    - **Remaining:** 23 calls today
-    - **Cache:** 1 hour
     """)
