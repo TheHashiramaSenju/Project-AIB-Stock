@@ -1,294 +1,603 @@
-
-
 """
-AI Budgeting Engine
-===================
-This file contains the core "brain" for the AI Budgeting feature.
-It takes a list of pre-analyzed stock candidates (from Finnhub),
-a user's budget, and a risk profile, then generates a
-complete, weighted, and costed investment plan.
-
-This logic is intentionally kept separate from the Streamlit UI
-for clarity and testability.
+AI Budgeting Engine - Alpha Vantage Version
+===========================================
+Uses technical analysis instead of analyst ratings.
+Implements portfolio optimization techniques with risk scoring.
 
 Author: Bhoomika M
-Date: 2025-10-29
+Date: 2025-11-07
+Version: 2.0
 """
 
 from typing import List, Dict, Tuple, Optional, Any
 import math
+from datetime import datetime
+
 
 class AIBudgeter:
     """
-    Encapsulates all logic for generating an AI-driven investment plan.
-    This class implements the rule-based logic for different risk profiles.
+    AI-driven investment plan generator using technical indicators.
+    
+    Features:
+    - Multiple risk profiles (Conservative, Moderate, Aggressive)
+    - Technical scoring system (0-100 scale)
+    - Sector-based diversification
+    - Dynamic budget allocation with leftover handling
+    - Comprehensive error handling and validation
     """
 
     def __init__(self):
         """
-        Initializes the AI Budgeter with predefined risk profile configurations.
-        These configurations are the "AI" rules that drive the portfolio selection.
+        Initialize the AI Budgeter with risk profile configurations.
         """
         
-        # This dictionary defines the core rules for each risk profile.
-        # It is exhaustive and directly implements the user's request.
+        # Risk profile configurations based on portfolio optimization principles
         self.RISK_PROFILES: Dict[str, Dict[str, Any]] = {
             'Conservative': {
-                'num_stocks': (5, 7),  # Target 5, max 7 stocks for broad diversification
+                'num_stocks': (5, 7),  # Target range for diversification
                 'allowed_sectors': [
                     'Technology', 
                     'Healthcare', 
                     'Financial', 
                     'Consumer Defensive', 
                     'Energy', 
-                    'Utilities'
+                    'Utilities',
+                    'Real Estate'
                 ],
-                'min_buy_score': 10,   # Minimum analyst "Buy" + "Strong Buy" count
-                'allocation_strategy': 'equal' # Diversified
+                'min_technical_score': 60,  # Out of 100
+                'allocation_strategy': 'equal',  # Equal weighting for safety
+                'max_single_allocation': 0.25,  # Max 25% in any single stock
+                'description': 'Broad diversification with stable sectors'
             },
             'Moderate': {
-                'num_stocks': (3, 5),  # Target 3, max 5 stocks for a balanced mix
+                'num_stocks': (3, 5),
                 'allowed_sectors': [
                     'Technology', 
                     'Consumer Cyclical', 
                     'Healthcare', 
                     'Financial',
-                    'Communication Services'
+                    'Communication Services',
+                    'Industrials'
                 ],
-                'min_buy_score': 15,   # Requires a stronger analyst conviction
-                'allocation_strategy': 'equal' # Balanced
+                'min_technical_score': 70,
+                'allocation_strategy': 'equal',
+                'max_single_allocation': 0.35,  # Max 35% in any single stock
+                'description': 'Balanced growth and stability'
             },
             'Aggressive': {
-                'num_stocks': (2, 3),  # Target 2, max 3 stocks for concentrated bets
+                'num_stocks': (2, 3),
                 'allowed_sectors': [
                     'Technology', 
-                    'Consumer Cyclical' # Focus on high-growth sectors
+                    'Consumer Cyclical',
+                    'Communication Services'
                 ],
-                'min_buy_score': 20,   # Must have very high analyst conviction
-                'allocation_strategy': 'weighted' # Concentrated in top picks
+                'min_technical_score': 80,
+                'allocation_strategy': 'weighted',  # Weighted towards top picks
+                'max_single_allocation': 0.50,  # Max 50% in any single stock
+                'description': 'Concentrated bets on high-conviction stocks'
             }
         }
-
-    def _filter_candidates(self, 
-                           stock_candidates: List[Dict], 
-                           config: Dict[str, Any]) -> List[Dict]:
+        
+        # Technical indicator weights for scoring
+        self.INDICATOR_WEIGHTS = {
+            'rsi': 0.30,      # 30% weight
+            'macd': 0.30,     # 30% weight
+            'trend': 0.20,    # 20% weight
+            'momentum': 0.20  # 20% weight (price change)
+        }
+        
+        # Logging
+        self.verbose = True
+    
+    def set_verbose(self, verbose: bool):
+        """Enable or disable verbose logging."""
+        self.verbose = verbose
+    
+    def _log(self, message: str):
+        """Internal logging function."""
+        if self.verbose:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            print(f"[{timestamp}] AI Budgeter: {message}")
+    
+    def _calculate_technical_score(self, stock: Dict) -> float:
         """
-        Private helper to filter the master list of candidates based on
-        the selected risk profile's configuration.
+        Calculate a 0-100 technical score based on multiple indicators.
+        
+        Scoring breakdown:
+        - RSI (30 points):
+          * <30 (oversold, buy signal) = 30 points
+          * 30-70 (neutral) = 15 points
+          * >70 (overbought, sell signal) = 0 points
+        
+        - MACD (30 points):
+          * BUY signal = 30 points
+          * HOLD signal = 15 points
+          * SELL signal = 0 points
+        
+        - Trend (20 points):
+          * BULLISH (SMA 50 > SMA 200) = 20 points
+          * NEUTRAL = 10 points
+          * BEARISH (SMA 50 < SMA 200) = 0 points
+        
+        - Momentum (20 points):
+          * Positive price change = 20 points
+          * Negative price change = 0 points
         
         Args:
-            stock_candidates: The full list of stocks from StockAdvisorFinnhub.
-            config: The specific risk profile dictionary (e.g., self.RISK_PROFILES['Conservative']).
-
+            stock: Dict containing technical indicator data
+            
         Returns:
-            A filtered list of stock candidates.
+            Technical score between 0 and 100
+        """
+        score = 0.0
+        
+        # RSI scoring (30 points max)
+        rsi = stock.get('rsi')
+        if rsi is not None:
+            try:
+                rsi_value = float(rsi)
+                if rsi_value < 30:  # Oversold - strong buy signal
+                    score += 30
+                elif 30 <= rsi_value <= 70:  # Neutral zone
+                    score += 15
+                # >70 overbought gets 0 points
+            except (ValueError, TypeError):
+                self._log(f"Warning: Invalid RSI value for {stock.get('symbol', 'unknown')}: {rsi}")
+        
+        # MACD scoring (30 points max)
+        macd = stock.get('macd_signal')
+        if macd:
+            macd_str = str(macd).upper()
+            if macd_str == 'BUY':
+                score += 30
+            elif macd_str == 'HOLD':
+                score += 15
+            # SELL gets 0 points
+        
+        # Trend scoring (20 points max)
+        trend = stock.get('trend')
+        if trend:
+            trend_str = str(trend).upper()
+            if trend_str == 'BULLISH':
+                score += 20
+            elif trend_str == 'NEUTRAL':
+                score += 10
+            # BEARISH gets 0 points
+        
+        # Price momentum scoring (20 points max)
+        change_pct = stock.get('change_percent', 0)
+        try:
+            change_value = float(str(change_pct).replace('%', ''))
+            if change_value > 0:
+                score += 20
+        except (ValueError, TypeError):
+            self._log(f"Warning: Invalid change_percent for {stock.get('symbol', 'unknown')}: {change_pct}")
+        
+        return round(score, 2)
+    
+    def _filter_candidates(self, stock_candidates: List[Dict], 
+                          config: Dict[str, Any]) -> List[Dict]:
+        """
+        Filter stocks by sector, technical score, and data validity.
+        
+        Args:
+            stock_candidates: List of stock dictionaries with technical data
+            config: Risk profile configuration
+            
+        Returns:
+            Filtered list of stocks that meet criteria
         """
         filtered_stocks = []
+        
         for stock in stock_candidates:
-            # 1. Check Sector
-            if stock.get('sector') not in config['allowed_sectors']:
-                continue
-                
-            # 2. Check Analyst Buy Score
-            if stock.get('buy_score', 0) < config['min_buy_score']:
-                continue
-                
-            # 3. Check for valid upside and price
-            if stock.get('upside_pct', 0) <= 0 or stock.get('current_price', 0) <= 0:
-                continue
-                
-            # If it passes all filters, add it to the list
-            filtered_stocks.append(stock)
+            symbol = stock.get('symbol', 'UNKNOWN')
             
+            # 1. Check for required fields
+            if not stock.get('sector'):
+                self._log(f"Skipping {symbol}: Missing sector information")
+                continue
+            
+            # 2. Check sector eligibility
+            if stock['sector'] not in config['allowed_sectors']:
+                self._log(f"Skipping {symbol}: Sector {stock['sector']} not allowed for this profile")
+                continue
+            
+            # 3. Calculate technical score
+            technical_score = self._calculate_technical_score(stock)
+            stock['technical_score'] = technical_score
+            
+            # 4. Check minimum technical score threshold
+            if technical_score < config['min_technical_score']:
+                self._log(f"Skipping {symbol}: Technical score {technical_score} below minimum {config['min_technical_score']}")
+                continue
+            
+            # 5. Validate price data
+            price = stock.get('price', 0)
+            try:
+                price = float(price)
+                if price <= 0:
+                    self._log(f"Skipping {symbol}: Invalid price {price}")
+                    continue
+                stock['price'] = price  # Ensure it's a float
+            except (ValueError, TypeError):
+                self._log(f"Skipping {symbol}: Cannot parse price {price}")
+                continue
+            
+            # 6. Calculate estimated 12-month target price
+            # Based on technical score strength (0-30% upside potential)
+            score_factor = technical_score / 100.0  # Normalize to 0-1
+            estimated_target = price * (1 + (score_factor * 0.30))  # Up to 30% upside
+            
+            stock['target_mean'] = round(estimated_target, 2)
+            stock['upside_pct'] = round(((estimated_target - price) / price) * 100, 2)
+            stock['buy_score'] = technical_score
+            
+            filtered_stocks.append(stock)
+            self._log(f"✓ {symbol}: Score={technical_score}, Price=${price:.2f}, Upside={stock['upside_pct']:.1f}%")
+        
         return filtered_stocks
-
+    
     def _rank_candidates(self, filtered_stocks: List[Dict]) -> List[Dict]:
         """
-        Ranks the filtered list of stocks.
-        The ranking is a weighted score of analyst conviction (buy_score)
-        and predicted upside (upside_pct) to find the best opportunities.
+        Rank stocks by weighted combination of technical score and upside potential.
+        
+        Ranking formula: (Technical Score × 0.6) + (Upside % × 0.4)
         
         Args:
-            filtered_stocks: The list of stocks that passed the filter.
-
+            filtered_stocks: List of filtered stocks
+            
         Returns:
-            A sorted list of stocks, best-to-worst.
+            Sorted list of stocks (best to worst)
         """
-        
-        # This score is the "secret sauce" of the AI, balancing conviction
-        # with raw upside potential.
         def calculate_weighted_score(stock):
-            # 40% weight to analyst conviction, 60% weight to predicted upside
-            conviction_score = stock.get('buy_score', 0)
-            upside_score = stock.get('upside_pct', 0)
-            return (conviction_score * 0.4) + (upside_score * 0.6)
-
-        # Sort the list in descending order by our new weighted score
+            technical = stock.get('technical_score', 0)
+            upside = stock.get('upside_pct', 0)
+            # Weight technical strength more heavily than pure upside
+            return (technical * 0.6) + (upside * 0.4)
+        
         filtered_stocks.sort(key=calculate_weighted_score, reverse=True)
+        
+        # Log the top 5 rankings
+        self._log("Top ranked stocks:")
+        for i, stock in enumerate(filtered_stocks[:5], 1):
+            score = calculate_weighted_score(stock)
+            self._log(f"  {i}. {stock['symbol']}: Weighted Score={score:.2f}")
+        
         return filtered_stocks
-
-    def _allocate_budget(self, 
-                         budget: float, 
-                         risk_profile: str, 
+    
+    def _allocate_budget(self, budget: float, risk_profile: str, 
                          selected_stocks: List[Dict]) -> List[Dict]:
         """
-        Performs the final budget allocation and share calculation.
-        This function implements the "Aggressive" weighted logic
-        and the "Conservative/Moderate" equal-weight logic.
+        Allocate budget across selected stocks based on strategy.
+        
+        Strategies:
+        - Equal: Divide budget equally (Conservative, Moderate)
+        - Weighted: Concentrate in top picks (Aggressive)
         
         Args:
-            budget: The total budget.
-            risk_profile: The user's chosen profile string.
-            selected_stocks: The final, sorted list of stocks to invest in.
-
+            budget: Total investment amount
+            risk_profile: Selected risk profile
+            selected_stocks: Stocks to invest in
+            
         Returns:
-            A list of plan items with exact cost and share counts.
+            List of investment plan items with shares and costs
         """
         num_stocks = len(selected_stocks)
         if num_stocks == 0:
-            return [] # Should not happen, but a robust check
-
-        allocation_strategy = self.RISK_PROFILES[risk_profile]['allocation_strategy']
+            return []
+        
+        config = self.RISK_PROFILES[risk_profile]
+        allocation_strategy = config['allocation_strategy']
+        max_single = config['max_single_allocation']
+        
         weights = []
-
-        # 1. Determine allocation weights based on strategy
+        
+        # Determine allocation weights based on strategy
         if allocation_strategy == 'weighted' and risk_profile == 'Aggressive':
-            # As requested: "concentrate" the budget
-            if num_stocks == 2:
-                weights = [0.60, 0.40]  # 60% to the #1 pick
-            elif num_stocks == 3:
-                weights = [0.50, 0.30, 0.20] # 50% to the #1 pick
-            else:
-                # Fallback for aggressive if only 1 stock is found
+            # Weighted allocation for aggressive profile
+            if num_stocks == 1:
                 weights = [1.0]
+            elif num_stocks == 2:
+                weights = [0.60, 0.40]  # 60/40 split
+            elif num_stocks == 3:
+                weights = [0.50, 0.30, 0.20]  # 50/30/20 split
+            else:
+                # Fallback to equal if more stocks than expected
+                weights = [1.0 / num_stocks] * num_stocks
         else:
-            # 'equal' strategy for Conservative and Moderate
+            # Equal weight allocation (default for Conservative and Moderate)
             weights = [1.0 / num_stocks] * num_stocks
-
-        # 2. Calculate allocation, shares, and cost for each stock
+        
+        # Enforce max single allocation constraint
+        for i in range(len(weights)):
+            if weights[i] > max_single:
+                self._log(f"Warning: Weight {weights[i]:.1%} exceeds max {max_single:.1%}, capping")
+                weights[i] = max_single
+        
+        # Normalize weights to sum to 1.0
+        total_weight = sum(weights)
+        if total_weight > 0:
+            weights = [w / total_weight for w in weights]
+        
+        # Calculate allocations
         final_plan = []
         total_cost_calculated = 0.0
         
         for i, stock in enumerate(selected_stocks):
             allocated_amount = budget * weights[i]
-            current_price = stock['current_price']
+            current_price = stock['price']
             
-            # Robust check for zero price
             if current_price <= 0:
                 shares_to_buy = 0.0
                 cost = 0.0
             else:
-                # Calculate exact shares
                 shares_to_buy = allocated_amount / current_price
-                cost = shares_to_buy * current_price # This will equal allocated_amount
+                cost = shares_to_buy * current_price
             
             total_cost_calculated += cost
-
+            
             plan_item = {
                 'symbol': stock['symbol'],
-                'company_name': stock.get('name', stock['symbol']), # Get name if available
+                'company_name': stock.get('name', stock['symbol']),
                 'sector': stock['sector'],
-                'shares': shares_to_buy,
+                'shares': round(shares_to_buy, 6),  # 6 decimal places for fractional shares
                 'current_price': current_price,
-                'cost': cost,
-                'allocation_pct': weights[i] * 100,
-                'target_mean': stock['targetMean'],
+                'cost': round(cost, 2),
+                'allocation_pct': round(weights[i] * 100, 2),
+                'target_mean': stock['target_mean'],
                 'upside_pct': stock['upside_pct'],
-                'buy_score': stock['buy_score']
+                'buy_score': stock['technical_score'],
+                'rsi': stock.get('rsi'),
+                'macd_signal': stock.get('macd_signal'),
+                'trend': stock.get('trend')
             }
             final_plan.append(plan_item)
             
-        # 3. Handle any leftover "dust" (small change)
-        # This ensures 100% of the budget is used
+            self._log(f"Allocated ${cost:.2f} ({weights[i]*100:.1f}%) to {stock['symbol']} = {shares_to_buy:.4f} shares")
+        
+        # Handle leftover budget (dust)
         leftover_budget = budget - total_cost_calculated
         
-        if leftover_budget > 0.01 and final_plan: # If more than 1 cent left
-            # Add the leftover dust to the #1 pick (highest conviction)
+        if leftover_budget > 0.01 and final_plan:
+            self._log(f"Leftover budget: ${leftover_budget:.2f}, adding to top pick")
             top_pick = final_plan[0]
+            
             if top_pick['current_price'] > 0:
                 extra_shares = leftover_budget / top_pick['current_price']
-                top_pick['shares'] += extra_shares
-                top_pick['cost'] += leftover_budget
+                top_pick['shares'] = round(top_pick['shares'] + extra_shares, 6)
+                top_pick['cost'] = round(top_pick['cost'] + leftover_budget, 2)
                 
-                # Recalculate allocation percentage for the top pick
+                # Recalculate allocation percentages
                 total_cost_final = sum(item['cost'] for item in final_plan)
                 for item in final_plan:
-                    item['allocation_pct'] = (item['cost'] / total_cost_final) * 100
+                    item['allocation_pct'] = round((item['cost'] / total_cost_final) * 100, 2)
         
         return final_plan
-
-    # --- PUBLIC FUNCTION ---
-
-    def generate_investment_plan(self, 
-                                 budget: float, 
-                                 risk_profile: str, 
-                                 stock_candidates: List[Dict]
-                                 ) -> Tuple[Optional[List[Dict]], Optional[str]]:
+    
+    def generate_investment_plan(self, budget: float, risk_profile: str, 
+                                stock_candidates: List[Dict]
+                                ) -> Tuple[Optional[List[Dict]], Optional[str]]:
         """
-        Generates a complete, AI-driven investment plan.
-        This is the main public entry point for this class.
-
-        Args:
-            budget: Total amount (e.g., 1000.0) to invest.
-            risk_profile: 'Conservative', 'Moderate', or 'Aggressive'.
-            stock_candidates: The list of analyzed stocks from StockAdvisorFinnhub.
-
-        Returns:
-            A tuple containing:
-            1. The final plan (List[Dict]) or None if it fails.
-            2. An error message (str) or None if it succeeds.
-        """
+        Main entry point: Generate a complete AI-driven investment plan.
         
-        # 1. --- Validation (Robustness) ---
-        print(f"AI Budgeter: Generating plan for ${budget} ({risk_profile})")
+        Process:
+        1. Validate inputs
+        2. Filter stocks by sector and technical criteria
+        3. Rank stocks by weighted score
+        4. Select top N stocks based on risk profile
+        5. Allocate budget with proper weighting
+        
+        Args:
+            budget: Total investment amount (minimum $50)
+            risk_profile: 'Conservative', 'Moderate', or 'Aggressive'
+            stock_candidates: List of stocks with technical analysis data
+            
+        Returns:
+            Tuple of:
+            - List of investment plan items (or None if failed)
+            - Error message (or None if successful)
+        """
+        self._log(f"Starting plan generation for ${budget:.2f} ({risk_profile})")
+        
+        # ===== INPUT VALIDATION =====
+        
+        # Check stock candidates
         if not stock_candidates:
-            print("AI Budgeter Error: Stock candidate list is empty.")
-            return None, "The AI stock analysis pool is empty. No stocks could be analyzed from Finnhub."
-            
+            error_msg = "No stock candidates provided for analysis. The market analysis returned empty."
+            self._log(f"ERROR: {error_msg}")
+            return None, error_msg
+        
+        # Check risk profile
         if risk_profile not in self.RISK_PROFILES:
-            print(f"AI Budgeter Error: Invalid risk profile '{risk_profile}'")
-            return None, f"Invalid risk profile '{risk_profile}' selected."
-            
-        if budget < 50.0:
-            print(f"AI Budgeter Error: Budget ${budget} is too small.")
-            return None, "Budget must be at least $50.00 to generate a diversified plan."
-
+            valid_profiles = ', '.join(self.RISK_PROFILES.keys())
+            error_msg = f"Invalid risk profile '{risk_profile}'. Must be one of: {valid_profiles}"
+            self._log(f"ERROR: {error_msg}")
+            return None, error_msg
+        
+        # Check budget
+        min_budget = 50.0
+        if budget < min_budget:
+            error_msg = f"Budget ${budget:.2f} is below minimum ${min_budget:.2f}. Please increase your budget."
+            self._log(f"ERROR: {error_msg}")
+            return None, error_msg
+        
+        if budget > 10_000_000:  # Sanity check
+            self._log("WARNING: Budget exceeds $10M, this is unusual")
+        
         config = self.RISK_PROFILES[risk_profile]
-
-        # 2. --- Filtering (The "AI" part 1) ---
-        print(f"AI Budgeter: Filtering {len(stock_candidates)} candidates for '{risk_profile}' profile...")
+        
+        # ===== FILTERING =====
+        
+        self._log(f"Filtering {len(stock_candidates)} candidates...")
+        self._log(f"Criteria: Sectors={len(config['allowed_sectors'])}, Min Score={config['min_technical_score']}")
+        
         filtered_stocks = self._filter_candidates(stock_candidates, config)
         
         if not filtered_stocks:
-            print("AI Budgeter Error: No stocks passed the filtering criteria.")
-            return None, (f"No stocks matched the strict criteria for a '{risk_profile}' profile "
-                          f"(Sectors: {', '.join(config['allowed_sectors'])}, "
-                          f"Min Buy Score: {config['min_buy_score']}). "
-                          f"Try a different risk profile (e.g., 'Moderate').")
-
-        # 3. --- Ranking ---
-        print(f"AI Budgeter: Ranking {len(filtered_stocks)} filtered stocks...")
+            sectors_str = ', '.join(config['allowed_sectors'])
+            error_msg = (
+                f"No stocks passed the filtering criteria for '{risk_profile}' profile.\n"
+                f"Criteria: Sectors [{sectors_str}], Min Technical Score {config['min_technical_score']}/100.\n"
+                f"Suggestion: Try 'Moderate' profile or check if market conditions are suitable."
+            )
+            self._log(f"ERROR: {error_msg}")
+            return None, error_msg
+        
+        self._log(f"✓ {len(filtered_stocks)} stocks passed filtering")
+        
+        # ===== RANKING =====
+        
+        self._log(f"Ranking stocks by weighted score...")
         ranked_stocks = self._rank_candidates(filtered_stocks)
-
-        # 4. --- Selection ---
-        num_to_select = config['num_stocks'][0] # Target the lower bound of the tuple (e.g., 5 for Conservative)
-        selected_stocks = ranked_stocks[:num_to_select]
+        
+        # ===== SELECTION =====
+        
+        num_to_select = config['num_stocks'][0]  # Target number (lower bound)
+        max_to_select = config['num_stocks'][1]   # Maximum number (upper bound)
+        
+        # Select top N, but don't exceed what's available
+        num_available = len(ranked_stocks)
+        actual_select = min(num_to_select, num_available)
+        
+        if actual_select < num_to_select:
+            self._log(f"WARNING: Only {actual_select} stocks available, target was {num_to_select}")
+        
+        selected_stocks = ranked_stocks[:actual_select]
         
         if len(selected_stocks) == 0:
-             print("AI Budgeter Error: No stocks were selected after ranking.")
-             return None, "An internal error occurred, and no stocks were selected for the plan."
-             
-        print(f"AI Budgeter: Selected top {len(selected_stocks)} stocks: {[s['symbol'] for s in selected_stocks]}")
-
-        # 5. --- Allocation (The "AI" part 2) ---
-        print(f"AI Budgeter: Allocating ${budget} across selected stocks...")
+            error_msg = "Internal error: No stocks were selected after ranking."
+            self._log(f"ERROR: {error_msg}")
+            return None, error_msg
+        
+        symbols = [s['symbol'] for s in selected_stocks]
+        self._log(f"✓ Selected {len(selected_stocks)} stocks: {', '.join(symbols)}")
+        
+        # ===== ALLOCATION =====
+        
+        self._log(f"Allocating ${budget:.2f} using '{config['allocation_strategy']}' strategy...")
         final_plan = self._allocate_budget(budget, risk_profile, selected_stocks)
         
         if not final_plan:
-             print("AI Budgeter Error: Budget allocation failed.")
-             return None, "An internal error occurred during budget allocation."
+            error_msg = "Internal error: Budget allocation failed."
+            self._log(f"ERROR: {error_msg}")
+            return None, error_msg
         
-        print(f"AI Budgeter: Plan generation complete. Returning {len(final_plan)} items.")
+        # ===== SUCCESS =====
         
-        # 6. --- Success ---
+        total_allocated = sum(item['cost'] for item in final_plan)
+        self._log(f"✅ Plan complete: {len(final_plan)} stocks, ${total_allocated:.2f} allocated")
+        
         return final_plan, None
+    
+    def get_risk_profile_info(self, risk_profile: str) -> Optional[Dict[str, Any]]:
+        """
+        Get detailed information about a risk profile.
+        
+        Args:
+            risk_profile: Profile name
+            
+        Returns:
+            Configuration dict or None if invalid
+        """
+        return self.RISK_PROFILES.get(risk_profile)
+    
+    def list_risk_profiles(self) -> List[str]:
+        """Get list of available risk profile names."""
+        return list(self.RISK_PROFILES.keys())
+    
+    def validate_stock_candidate(self, stock: Dict) -> Tuple[bool, str]:
+        """
+        Validate that a stock candidate has all required fields.
+        
+        Args:
+            stock: Stock dictionary to validate
+            
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        required_fields = ['symbol', 'sector', 'price']
+        optional_fields = ['rsi', 'macd_signal', 'trend', 'change_percent']
+        
+        # Check required fields
+        for field in required_fields:
+            if field not in stock or stock[field] is None:
+                return False, f"Missing required field: {field}"
+        
+        # Validate price
+        try:
+            price = float(stock['price'])
+            if price <= 0:
+                return False, f"Invalid price: {price}"
+        except (ValueError, TypeError):
+            return False, f"Cannot parse price: {stock.get('price')}"
+        
+        # Check for at least some technical indicators
+        has_indicators = any(stock.get(field) is not None for field in optional_fields)
+        if not has_indicators:
+            return False, "No technical indicators present (rsi, macd_signal, trend, change_percent)"
+        
+        return True, "Valid"
+
+
+# ==================== EXAMPLE USAGE ====================
+
+if __name__ == "__main__":
+    """
+    Example usage and testing of AIBudgeter.
+    """
+    
+    # Initialize budgeter
+    budgeter = AIBudgeter()
+    
+    # Example stock candidates (normally from StockAdvisorAlphaVantage)
+    mock_candidates = [
+        {
+            'symbol': 'AAPL',
+            'name': 'Apple Inc.',
+            'sector': 'Technology',
+            'price': 175.50,
+            'rsi': 45.0,
+            'macd_signal': 'BUY',
+            'trend': 'BULLISH',
+            'change_percent': '1.2%'
+        },
+        {
+            'symbol': 'MSFT',
+            'name': 'Microsoft Corp.',
+            'sector': 'Technology',
+            'price': 380.25,
+            'rsi': 55.0,
+            'macd_signal': 'BUY',
+            'trend': 'BULLISH',
+            'change_percent': '0.8%'
+        },
+        {
+            'symbol': 'JNJ',
+            'name': 'Johnson & Johnson',
+            'sector': 'Healthcare',
+            'price': 160.00,
+            'rsi': 50.0,
+            'macd_signal': 'HOLD',
+            'trend': 'BULLISH',
+            'change_percent': '0.3%'
+        }
+    ]
+    
+    # Test plan generation
+    print("\n=== Testing AI Budgeter ===\n")
+    
+    budget = 1000.0
+    risk_profile = 'Moderate'
+    
+    plan, error = budgeter.generate_investment_plan(budget, risk_profile, mock_candidates)
+    
+    if error:
+        print(f"❌ Error: {error}")
+    elif plan:
+        print(f"\n✅ Investment Plan Generated!\n")
+        for item in plan:
+            print(f"{item['symbol']:6} | ${item['cost']:8.2f} ({item['allocation_pct']:5.1f}%) | "
+                  f"{item['shares']:.4f} shares @ ${item['current_price']:.2f}")
+        
+        total = sum(item['cost'] for item in plan)
+        print(f"\nTotal: ${total:.2f}")
