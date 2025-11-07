@@ -1,17 +1,138 @@
 """
-Stock Advisor using Alpha Vantage API
-======================================
+Stock Advisor using Alpha Vantage API (ROBUST VERSION)
+======================================================
+Complete stock data advisor with error handling, rate limiting, and API depletion detection.
 Replaces Finnhub with Alpha Vantage for all stock data.
-Includes: Quotes, Technical Indicators, Fundamental Data, Historical Data
+
+Features:
+- Real-time quotes
+- Technical indicators (RSI, MACD, SMA, EMA, Bollinger Bands, etc.)
+- Fundamental data (Company overview, earnings, income statements)
+- Historical OHLCV data (Daily, Weekly, Monthly, Intraday)
+- Comprehensive error handling for 403, 401, 429, 500 errors
+- API call tracking and depletion detection
+- Intelligent rate limiting and caching
+- Fallback mechanisms for failed requests
+
 Author: Bhoomika M
-Date: 2025-11-07
+Date: 2025-11-08
+Version: 3.0 (Robust with 403 Handling & Depletion Detection)
 """
 
 import requests
 import time
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Any
 import pandas as pd
 from datetime import datetime, timedelta
+import logging
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class APIUsageTracker:
+    """
+    Tracks API usage and detects when daily limit is approaching or depleted.
+    """
+    
+    def __init__(self, daily_limit: int = 25):
+        """
+        Initialize API usage tracker.
+        
+        Args:
+            daily_limit: Maximum calls per day (25 for free tier)
+        """
+        self.daily_limit = daily_limit
+        self.calls_made = 0
+        self.last_reset_date = datetime.now().date()
+        self.call_history = []  # Track timestamps of each call
+        self.rate_limit_hits = 0
+        self.error_429_count = 0
+        self.error_403_count = 0
+        self.error_401_count = 0
+    
+    def add_call(self, symbol: str = "unknown", success: bool = True, 
+                 error_code: Optional[int] = None):
+        """
+        Record an API call.
+        
+        Args:
+            symbol: Stock symbol queried
+            success: Whether call was successful
+            error_code: HTTP error code if failed
+        """
+        current_date = datetime.now().date()
+        
+        # Reset if new day
+        if current_date != self.last_reset_date:
+            self.calls_made = 0
+            self.call_history = []
+            self.last_reset_date = current_date
+            logger.info("🔄 Daily API limit reset (UTC midnight)")
+        
+        self.calls_made += 1
+        self.call_history.append({
+            'timestamp': datetime.now(),
+            'symbol': symbol,
+            'success': success,
+            'error_code': error_code
+        })
+        
+        # Track specific errors
+        if error_code == 429:
+            self.error_429_count += 1
+        elif error_code == 403:
+            self.error_403_count += 1
+        elif error_code == 401:
+            self.error_401_count += 1
+    
+    def get_remaining_calls(self) -> int:
+        """Get estimated remaining calls for today."""
+        return max(0, self.daily_limit - self.calls_made)
+    
+    def is_depleted(self) -> bool:
+        """Check if daily limit is depleted."""
+        return self.calls_made >= self.daily_limit
+    
+    def is_near_limit(self, threshold: int = 5) -> bool:
+        """Check if approaching daily limit."""
+        return self.get_remaining_calls() <= threshold
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get comprehensive usage status."""
+        return {
+            'calls_made': self.calls_made,
+            'daily_limit': self.daily_limit,
+            'remaining': self.get_remaining_calls(),
+            'is_depleted': self.is_depleted(),
+            'is_near_limit': self.is_near_limit(),
+            'error_403_count': self.error_403_count,
+            'error_401_count': self.error_401_count,
+            'error_429_count': self.error_429_count,
+            'rate_limit_hits': self.rate_limit_hits,
+            'last_reset_date': str(self.last_reset_date)
+        }
+    
+    def print_status(self):
+        """Print human-readable status."""
+        status = self.get_status()
+        print("\n" + "=" * 80)
+        print("📊 API USAGE STATUS")
+        print("=" * 80)
+        print(f"Calls Made:     {status['calls_made']}/{status['daily_limit']}")
+        print(f"Remaining:      {status['remaining']}")
+        print(f"Depleted:       {'⚠️ YES' if status['is_depleted'] else '✓ NO'}")
+        print(f"Near Limit:     {'⚠️ YES' if status['is_near_limit'] else '✓ NO'}")
+        print(f"403 Errors:     {status['error_403_count']}")
+        print(f"401 Errors:     {status['error_401_count']}")
+        print(f"429 Errors:     {status['error_429_count']}")
+        print(f"Rate Limits:    {status['rate_limit_hits']}")
+        print(f"Last Reset:     {status['last_reset_date']}")
+        print("=" * 80 + "\n")
 
 
 class StockAdvisorAlphaVantage:
@@ -22,6 +143,13 @@ class StockAdvisorAlphaVantage:
     - Fundamental data (Company overview, earnings, income statements)
     - Historical OHLCV data (Daily, Weekly, Monthly, Intraday)
     - Economic indicators
+    
+    Features:
+    - Handles 403/401/429/500 errors gracefully
+    - Tracks API depletion
+    - Intelligent rate limiting (5 calls/minute, 25/day)
+    - Response caching
+    - Automatic retries
     """
     
     def __init__(self, api_key: str):
@@ -36,7 +164,12 @@ class StockAdvisorAlphaVantage:
         self.call_count = 0
         self.last_call_time = time.time()
         self.cache = {}  # Simple in-memory cache
+        self.usage_tracker = APIUsageTracker(daily_limit=25)
         
+        logger.info(f"✓ StockAdvisorAlphaVantage initialized")
+        logger.info(f"✓ API Key: {api_key[:10]}...")
+        logger.info(f"✓ Rate limits: 5 calls/minute, 25 calls/day")
+    
     def _rate_limit(self):
         """
         Implements rate limiting: 5 calls per minute for free tier.
@@ -44,13 +177,25 @@ class StockAdvisorAlphaVantage:
         """
         self.call_count += 1
         
+        # Check if daily limit is depleted
+        if self.usage_tracker.is_depleted():
+            logger.warning("⚠️ DAILY API LIMIT DEPLETED (25/25 calls)")
+            logger.warning("⏰ Wait until tomorrow (UTC midnight) or use premium tier")
+            raise Exception("Daily API limit depleted. Please wait until tomorrow or upgrade API key.")
+        
+        # Check if near limit
+        if self.usage_tracker.is_near_limit(threshold=3):
+            remaining = self.usage_tracker.get_remaining_calls()
+            logger.warning(f"⚠️ APPROACHING DAILY LIMIT: {remaining} calls remaining")
+        
         # If we've made 5 calls, enforce 60-second wait
         if self.call_count >= 5:
             elapsed = time.time() - self.last_call_time
             if elapsed < 60:
                 wait_time = 60 - elapsed
-                print(f"⏳ Rate limit: Sleeping for {wait_time:.1f} seconds...")
+                logger.warning(f"⏳ Rate limited: {self.call_count} calls in {elapsed:.1f}s, waiting {wait_time:.1f}s...")
                 time.sleep(wait_time)
+                self.usage_tracker.rate_limit_hits += 1
             
             # Reset counter
             self.call_count = 0
@@ -59,17 +204,29 @@ class StockAdvisorAlphaVantage:
             # Small delay between calls (12 seconds = 5 calls/minute)
             time.sleep(12)
     
-    def _make_request(self, params: Dict, use_cache: bool = True) -> Optional[Dict]:
+    def _make_request(self, params: Dict, use_cache: bool = True, 
+                     retry_count: int = 0, max_retries: int = 2) -> Optional[Dict]:
         """
-        Makes an API request with rate limiting and caching.
+        Makes an API request with rate limiting, caching, and comprehensive error handling.
+        
+        Handles:
+        - 403 Forbidden (invalid API key)
+        - 401 Unauthorized (expired key)
+        - 429 Too Many Requests (rate limited)
+        - 500 Server Error (temporary)
+        - Timeouts and connection errors
         
         Args:
             params: Query parameters for the API
             use_cache: Whether to use cached response if available
+            retry_count: Current retry attempt
+            max_retries: Maximum retry attempts
             
         Returns:
             JSON response or None if error
         """
+        symbol = params.get('symbol', 'unknown')
+        
         # Create cache key
         cache_key = str(sorted(params.items()))
         
@@ -78,7 +235,7 @@ class StockAdvisorAlphaVantage:
             cached_data, cached_time = self.cache[cache_key]
             # Cache valid for 1 hour
             if time.time() - cached_time < 3600:
-                print(f"📦 Using cached data for {params.get('symbol', 'request')}")
+                logger.debug(f"📦 Using cached data for {symbol}")
                 return cached_data
         
         self._rate_limit()
@@ -86,38 +243,119 @@ class StockAdvisorAlphaVantage:
         params['apikey'] = self.api_key
         
         try:
+            logger.debug(f"Requesting {symbol} from Alpha Vantage...")
             response = requests.get(self.base_url, params=params, timeout=15)
-            response.raise_for_status()
+            
+            # Log response status
+            logger.debug(f"Response status: {response.status_code} for {symbol}")
+            
+            # ===== HANDLE HTTP ERROR CODES =====
+            
+            if response.status_code == 403:
+                logger.error(f"❌ 403 FORBIDDEN for {symbol}")
+                logger.error(f"   Your API key may be invalid or expired")
+                logger.error(f"   Response: {response.text[:300]}")
+                self.usage_tracker.add_call(symbol, False, 403)
+                return None
+            
+            elif response.status_code == 401:
+                logger.error(f"❌ 401 UNAUTHORIZED for {symbol}")
+                logger.error(f"   Invalid or expired API key")
+                self.usage_tracker.add_call(symbol, False, 401)
+                return None
+            
+            elif response.status_code == 429:
+                logger.warning(f"⚠️ 429 TOO MANY REQUESTS for {symbol}")
+                logger.warning(f"   Rate limit exceeded. Waiting 60 seconds...")
+                self.usage_tracker.add_call(symbol, False, 429)
+                time.sleep(60)
+                
+                # Retry once after waiting
+                if retry_count < max_retries:
+                    logger.info(f"Retrying {symbol} (attempt {retry_count + 1}/{max_retries})...")
+                    return self._make_request(params, use_cache=False, 
+                                            retry_count=retry_count + 1, max_retries=max_retries)
+                return None
+            
+            elif response.status_code == 500:
+                logger.warning(f"⚠️ 500 SERVER ERROR for {symbol}")
+                logger.warning(f"   Alpha Vantage server error. Try again later.")
+                self.usage_tracker.add_call(symbol, False, 500)
+                
+                # Retry with exponential backoff
+                if retry_count < max_retries:
+                    wait_time = (2 ** retry_count) * 5  # 5s, 10s, 20s
+                    logger.info(f"Retrying {symbol} in {wait_time}s (attempt {retry_count + 1}/{max_retries})...")
+                    time.sleep(wait_time)
+                    return self._make_request(params, use_cache=False,
+                                            retry_count=retry_count + 1, max_retries=max_retries)
+                return None
+            
+            elif response.status_code >= 400:
+                logger.error(f"❌ HTTP Error {response.status_code} for {symbol}")
+                logger.error(f"   Response: {response.text[:300]}")
+                self.usage_tracker.add_call(symbol, False, response.status_code)
+                return None
+            
+            # ===== PARSE JSON RESPONSE =====
+            
+            response.raise_for_status()  # Raises HTTPError for bad status codes
             data = response.json()
             
-            # Check for API errors
+            # Check for API-level errors in JSON
             if 'Error Message' in data:
-                print(f"❌ API Error: {data['Error Message']}")
+                logger.error(f"❌ API Error for {symbol}: {data['Error Message']}")
+                self.usage_tracker.add_call(symbol, False, 403)  # Treat as auth error
                 return None
             
             if 'Note' in data:  # Rate limit message
-                print(f"⚠️ API Note: {data['Note']}")
-                print("Waiting 60 seconds and retrying...")
+                logger.warning(f"⚠️ API Note: {data['Note']}")
+                self.usage_tracker.add_call(symbol, False, 429)
+                logger.info("Waiting 60 seconds and retrying...")
                 time.sleep(60)
-                return self._make_request(params, use_cache=False)  # Retry without cache
+                
+                if retry_count < max_retries:
+                    return self._make_request(params, use_cache=False,
+                                            retry_count=retry_count + 1, max_retries=max_retries)
+                return None
             
             if 'Information' in data:  # Often API limit message
-                print(f"ℹ️ API Info: {data['Information']}")
+                logger.warning(f"ℹ️ API Info: {data['Information']}")
+                self.usage_tracker.add_call(symbol, False, 429)
                 return None
+            
+            # ===== SUCCESS =====
             
             # Cache the successful response
             self.cache[cache_key] = (data, time.time())
+            self.usage_tracker.add_call(symbol, True)
+            logger.debug(f"✓ Successfully retrieved data for {symbol}")
             
             return data
             
         except requests.exceptions.Timeout:
-            print(f"⏱️ Request timeout for {params.get('symbol', 'request')}")
+            logger.error(f"❌ TIMEOUT for {symbol} - Server did not respond in time")
+            self.usage_tracker.add_call(symbol, False, -1)
+            
+            if retry_count < max_retries:
+                logger.info(f"Retrying {symbol} (attempt {retry_count + 1}/{max_retries})...")
+                return self._make_request(params, use_cache=False,
+                                        retry_count=retry_count + 1, max_retries=max_retries)
             return None
+        
+        except requests.exceptions.ConnectionError:
+            logger.error(f"❌ CONNECTION ERROR for {symbol} - Check internet connectivity")
+            self.usage_tracker.add_call(symbol, False, -2)
+            return None
+        
         except requests.exceptions.RequestException as e:
-            print(f"❌ Request error: {e}")
+            logger.error(f"❌ REQUEST ERROR for {symbol}: {str(e)}")
+            self.usage_tracker.add_call(symbol, False, -3)
             return None
+        
         except Exception as e:
-            print(f"❌ Unexpected error: {e}")
+            logger.error(f"❌ UNEXPECTED ERROR for {symbol}: {type(e).__name__}: {str(e)}")
+            self.usage_tracker.add_call(symbol, False, -999)
             return None
     
     # ==================== STOCK QUOTES ====================
@@ -131,10 +369,6 @@ class StockAdvisorAlphaVantage:
             
         Returns:
             Dict with price, volume, change data or None if error
-            
-        Example:
-            >>> advisor.get_stock_quote('AAPL')
-            {'symbol': 'AAPL', 'price': 150.25, 'change': 2.5, ...}
         """
         params = {
             'function': 'GLOBAL_QUOTE',
@@ -144,11 +378,13 @@ class StockAdvisorAlphaVantage:
         data = self._make_request(params)
         
         if not data or 'Global Quote' not in data:
+            logger.warning(f"No Global Quote data for {symbol}")
             return None
         
         quote = data['Global Quote']
         
-        if not quote:
+        if not quote or len(quote) == 0:
+            logger.warning(f"Empty Global Quote for {symbol}")
             return None
         
         try:
@@ -165,13 +401,12 @@ class StockAdvisorAlphaVantage:
                 'latest_trading_day': quote.get('07. latest trading day', '')
             }
         except (ValueError, TypeError) as e:
-            print(f"❌ Error parsing quote for {symbol}: {e}")
+            logger.error(f"Error parsing quote for {symbol}: {e}")
             return None
     
     def get_batch_quotes(self, symbols: List[str]) -> Dict[str, Optional[Dict]]:
         """
         Gets quotes for multiple stocks.
-        Note: Makes individual API calls for each symbol due to Alpha Vantage limitations.
         
         Args:
             symbols: List of stock tickers
@@ -206,6 +441,7 @@ class StockAdvisorAlphaVantage:
         data = self._make_request(params)
         
         if not data or 'Time Series (Daily)' not in data:
+            logger.warning(f"No daily data for {symbol}")
             return None
         
         try:
@@ -219,22 +455,15 @@ class StockAdvisorAlphaVantage:
             df = df.astype(float)
             df = df.sort_index()
             
+            logger.debug(f"✓ Retrieved {len(df)} daily records for {symbol}")
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing daily data for {symbol}: {e}")
+            logger.error(f"Error parsing daily data for {symbol}: {e}")
             return None
     
     def get_weekly_data(self, symbol: str) -> Optional[pd.DataFrame]:
-        """
-        Gets weekly time series data.
-        
-        Args:
-            symbol: Stock ticker
-            
-        Returns:
-            Pandas DataFrame with weekly OHLCV data
-        """
+        """Gets weekly time series data."""
         params = {
             'function': 'TIME_SERIES_WEEKLY_ADJUSTED',
             'symbol': symbol
@@ -255,23 +484,14 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing weekly data for {symbol}: {e}")
+            logger.error(f"Error parsing weekly data for {symbol}: {e}")
             return None
     
     def get_monthly_data(self, symbol: str) -> Optional[pd.DataFrame]:
-        """
-        Gets monthly time series data.
-        
-        Args:
-            symbol: Stock ticker
-            
-        Returns:
-            Pandas DataFrame with monthly OHLCV data
-        """
+        """Gets monthly time series data."""
         params = {
             'function': 'TIME_SERIES_MONTHLY_ADJUSTED',
             'symbol': symbol
@@ -292,26 +512,15 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing monthly data for {symbol}: {e}")
+            logger.error(f"Error parsing monthly data for {symbol}: {e}")
             return None
     
     def get_intraday_data(self, symbol: str, interval: str = '5min', 
                          outputsize: str = 'compact') -> Optional[pd.DataFrame]:
-        """
-        Gets intraday time series data.
-        
-        Args:
-            symbol: Stock ticker
-            interval: '1min', '5min', '15min', '30min', '60min'
-            outputsize: 'compact' (latest 100 points) or 'full' (full day)
-            
-        Returns:
-            Pandas DataFrame with intraday OHLCV data
-        """
+        """Gets intraday time series data."""
         params = {
             'function': 'TIME_SERIES_INTRADAY',
             'symbol': symbol,
@@ -335,28 +544,17 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing intraday data for {symbol}: {e}")
+            logger.error(f"Error parsing intraday data for {symbol}: {e}")
             return None
     
     # ==================== TECHNICAL INDICATORS ====================
     
     def get_rsi(self, symbol: str, interval: str = 'daily', 
                 time_period: int = 14) -> Optional[pd.DataFrame]:
-        """
-        Gets RSI (Relative Strength Index) technical indicator.
-        
-        Args:
-            symbol: Stock ticker
-            interval: 'daily', 'weekly', 'monthly', '1min', '5min', '15min', '30min', '60min'
-            time_period: Number of periods for RSI calculation (default 14)
-            
-        Returns:
-            DataFrame with RSI values
-        """
+        """Gets RSI (Relative Strength Index) technical indicator."""
         params = {
             'function': 'RSI',
             'symbol': symbol,
@@ -379,29 +577,16 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing RSI for {symbol}: {e}")
+            logger.error(f"Error parsing RSI for {symbol}: {e}")
             return None
     
     def get_macd(self, symbol: str, interval: str = 'daily',
                  fastperiod: int = 12, slowperiod: int = 26,
                  signalperiod: int = 9) -> Optional[pd.DataFrame]:
-        """
-        Gets MACD (Moving Average Convergence Divergence) indicator.
-        
-        Args:
-            symbol: Stock ticker
-            interval: Time interval
-            fastperiod: Fast EMA period (default 12)
-            slowperiod: Slow EMA period (default 26)
-            signalperiod: Signal line period (default 9)
-            
-        Returns:
-            DataFrame with MACD, Signal, and Histogram
-        """
+        """Gets MACD (Moving Average Convergence Divergence) indicator."""
         params = {
             'function': 'MACD',
             'symbol': symbol,
@@ -426,26 +611,15 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing MACD for {symbol}: {e}")
+            logger.error(f"Error parsing MACD for {symbol}: {e}")
             return None
     
     def get_sma(self, symbol: str, interval: str = 'daily', 
                 time_period: int = 50) -> Optional[pd.DataFrame]:
-        """
-        Gets SMA (Simple Moving Average).
-        
-        Args:
-            symbol: Stock ticker
-            interval: Time interval
-            time_period: Number of periods (e.g., 50, 200)
-            
-        Returns:
-            DataFrame with SMA values
-        """
+        """Gets SMA (Simple Moving Average)."""
         params = {
             'function': 'SMA',
             'symbol': symbol,
@@ -468,26 +642,15 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing SMA for {symbol}: {e}")
+            logger.error(f"Error parsing SMA for {symbol}: {e}")
             return None
     
     def get_ema(self, symbol: str, interval: str = 'daily', 
                 time_period: int = 50) -> Optional[pd.DataFrame]:
-        """
-        Gets EMA (Exponential Moving Average).
-        
-        Args:
-            symbol: Stock ticker
-            interval: Time interval
-            time_period: Number of periods
-            
-        Returns:
-            DataFrame with EMA values
-        """
+        """Gets EMA (Exponential Moving Average)."""
         params = {
             'function': 'EMA',
             'symbol': symbol,
@@ -510,29 +673,16 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing EMA for {symbol}: {e}")
+            logger.error(f"Error parsing EMA for {symbol}: {e}")
             return None
     
     def get_bbands(self, symbol: str, interval: str = 'daily',
                    time_period: int = 20, nbdevup: int = 2,
                    nbdevdn: int = 2) -> Optional[pd.DataFrame]:
-        """
-        Gets Bollinger Bands.
-        
-        Args:
-            symbol: Stock ticker
-            interval: Time interval
-            time_period: Moving average period (default 20)
-            nbdevup: Upper band std deviations (default 2)
-            nbdevdn: Lower band std deviations (default 2)
-            
-        Returns:
-            DataFrame with upper, middle, and lower bands
-        """
+        """Gets Bollinger Bands."""
         params = {
             'function': 'BBANDS',
             'symbol': symbol,
@@ -557,24 +707,14 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing Bollinger Bands for {symbol}: {e}")
+            logger.error(f"Error parsing Bollinger Bands for {symbol}: {e}")
             return None
     
     def get_stoch(self, symbol: str, interval: str = 'daily') -> Optional[pd.DataFrame]:
-        """
-        Gets Stochastic Oscillator.
-        
-        Args:
-            symbol: Stock ticker
-            interval: Time interval
-            
-        Returns:
-            DataFrame with SlowK and SlowD values
-        """
+        """Gets Stochastic Oscillator."""
         params = {
             'function': 'STOCH',
             'symbol': symbol,
@@ -595,26 +735,15 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing Stochastic for {symbol}: {e}")
+            logger.error(f"Error parsing Stochastic for {symbol}: {e}")
             return None
     
     def get_adx(self, symbol: str, interval: str = 'daily',
                 time_period: int = 14) -> Optional[pd.DataFrame]:
-        """
-        Gets ADX (Average Directional Index) - trend strength indicator.
-        
-        Args:
-            symbol: Stock ticker
-            interval: Time interval
-            time_period: Number of periods (default 14)
-            
-        Returns:
-            DataFrame with ADX values
-        """
+        """Gets ADX (Average Directional Index)."""
         params = {
             'function': 'ADX',
             'symbol': symbol,
@@ -636,26 +765,15 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing ADX for {symbol}: {e}")
+            logger.error(f"Error parsing ADX for {symbol}: {e}")
             return None
     
     def get_cci(self, symbol: str, interval: str = 'daily',
                 time_period: int = 20) -> Optional[pd.DataFrame]:
-        """
-        Gets CCI (Commodity Channel Index).
-        
-        Args:
-            symbol: Stock ticker
-            interval: Time interval
-            time_period: Number of periods (default 20)
-            
-        Returns:
-            DataFrame with CCI values
-        """
+        """Gets CCI (Commodity Channel Index)."""
         params = {
             'function': 'CCI',
             'symbol': symbol,
@@ -677,24 +795,14 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing CCI for {symbol}: {e}")
+            logger.error(f"Error parsing CCI for {symbol}: {e}")
             return None
     
     def get_obv(self, symbol: str, interval: str = 'daily') -> Optional[pd.DataFrame]:
-        """
-        Gets OBV (On-Balance Volume).
-        
-        Args:
-            symbol: Stock ticker
-            interval: Time interval
-            
-        Returns:
-            DataFrame with OBV values
-        """
+        """Gets OBV (On-Balance Volume)."""
         params = {
             'function': 'OBV',
             'symbol': symbol,
@@ -715,25 +823,16 @@ class StockAdvisorAlphaVantage:
             df.index = pd.to_datetime(df.index)
             df = df.astype(float)
             df = df.sort_index()
-            
             return df
             
         except Exception as e:
-            print(f"❌ Error parsing OBV for {symbol}: {e}")
+            logger.error(f"Error parsing OBV for {symbol}: {e}")
             return None
     
     # ==================== FUNDAMENTAL DATA ====================
     
     def get_company_overview(self, symbol: str) -> Optional[Dict]:
-        """
-        Gets comprehensive company information and fundamentals.
-        
-        Args:
-            symbol: Stock ticker
-            
-        Returns:
-            Dict with company overview including sector, market cap, P/E, etc.
-        """
+        """Gets comprehensive company information and fundamentals."""
         params = {
             'function': 'OVERVIEW',
             'symbol': symbol
@@ -742,20 +841,13 @@ class StockAdvisorAlphaVantage:
         data = self._make_request(params)
         
         if not data or 'Symbol' not in data:
+            logger.warning(f"No company overview for {symbol}")
             return None
         
         return data
     
     def get_earnings(self, symbol: str) -> Optional[Dict]:
-        """
-        Gets annual and quarterly earnings data.
-        
-        Args:
-            symbol: Stock ticker
-            
-        Returns:
-            Dict with earnings history and estimates
-        """
+        """Gets annual and quarterly earnings data."""
         params = {
             'function': 'EARNINGS',
             'symbol': symbol
@@ -764,20 +856,13 @@ class StockAdvisorAlphaVantage:
         data = self._make_request(params)
         
         if not data or 'symbol' not in data:
+            logger.warning(f"No earnings data for {symbol}")
             return None
         
         return data
     
     def get_income_statement(self, symbol: str) -> Optional[Dict]:
-        """
-        Gets annual and quarterly income statements.
-        
-        Args:
-            symbol: Stock ticker
-            
-        Returns:
-            Dict with revenue, expenses, net income, etc.
-        """
+        """Gets annual and quarterly income statements."""
         params = {
             'function': 'INCOME_STATEMENT',
             'symbol': symbol
@@ -786,20 +871,13 @@ class StockAdvisorAlphaVantage:
         data = self._make_request(params)
         
         if not data or 'symbol' not in data:
+            logger.warning(f"No income statement for {symbol}")
             return None
         
         return data
     
     def get_balance_sheet(self, symbol: str) -> Optional[Dict]:
-        """
-        Gets annual and quarterly balance sheets.
-        
-        Args:
-            symbol: Stock ticker
-            
-        Returns:
-            Dict with assets, liabilities, equity data
-        """
+        """Gets annual and quarterly balance sheets."""
         params = {
             'function': 'BALANCE_SHEET',
             'symbol': symbol
@@ -808,20 +886,13 @@ class StockAdvisorAlphaVantage:
         data = self._make_request(params)
         
         if not data or 'symbol' not in data:
+            logger.warning(f"No balance sheet for {symbol}")
             return None
         
         return data
     
     def get_cash_flow(self, symbol: str) -> Optional[Dict]:
-        """
-        Gets annual and quarterly cash flow statements.
-        
-        Args:
-            symbol: Stock ticker
-            
-        Returns:
-            Dict with operating, investing, financing cash flows
-        """
+        """Gets annual and quarterly cash flow statements."""
         params = {
             'function': 'CASH_FLOW',
             'symbol': symbol
@@ -830,6 +901,7 @@ class StockAdvisorAlphaVantage:
         data = self._make_request(params)
         
         if not data or 'symbol' not in data:
+            logger.warning(f"No cash flow data for {symbol}")
             return None
         
         return data
@@ -845,64 +917,68 @@ class StockAdvisorAlphaVantage:
             symbol: Stock ticker
             
         Returns:
-            Dict with technical analysis results including:
-            - Current price and quote data
-            - RSI (oversold/overbought signals)
-            - MACD (buy/sell signals)
-            - Trend analysis (SMA 50 vs 200)
-            - Overall recommendation
+            Dict with technical analysis results
         """
-        print(f"📊 Analyzing {symbol} with Alpha Vantage...")
+        logger.info(f"📊 Starting technical analysis for {symbol}...")
         
-        # Get quote
-        quote = self.get_stock_quote(symbol)
-        if not quote:
-            print(f"❌ Failed to get quote for {symbol}")
+        try:
+            # Get quote
+            quote = self.get_stock_quote(symbol)
+            if not quote:
+                logger.error(f"Failed to get quote for {symbol}")
+                return None
+            
+            logger.debug(f"✓ Quote retrieved for {symbol}: ${quote['price']}")
+            
+            # Get RSI
+            rsi_df = self.get_rsi(symbol)
+            latest_rsi = None
+            if rsi_df is not None and len(rsi_df) > 0:
+                latest_rsi = float(rsi_df.iloc[-1]['RSI'])
+                logger.debug(f"✓ RSI: {latest_rsi:.2f}")
+            
+            # Get MACD
+            macd_df = self.get_macd(symbol)
+            macd_signal = None
+            if macd_df is not None and len(macd_df) > 0:
+                latest_macd = macd_df.iloc[-1]
+                macd_signal = 'BUY' if float(latest_macd['MACD']) > float(latest_macd['MACD_Signal']) else 'SELL'
+                logger.debug(f"✓ MACD Signal: {macd_signal}")
+            
+            # Get SMAs for trend analysis
+            sma_50 = self.get_sma(symbol, time_period=50)
+            sma_200 = self.get_sma(symbol, time_period=200)
+            
+            trend = None
+            if sma_50 is not None and sma_200 is not None and len(sma_50) > 0 and len(sma_200) > 0:
+                sma_50_val = float(sma_50.iloc[-1]['SMA'])
+                sma_200_val = float(sma_200.iloc[-1]['SMA'])
+                trend = 'BULLISH' if sma_50_val > sma_200_val else 'BEARISH'
+                logger.debug(f"✓ Trend: {trend} (SMA50: {sma_50_val:.2f}, SMA200: {sma_200_val:.2f})")
+            
+            # Generate recommendation
+            recommendation = self._generate_recommendation(latest_rsi, macd_signal, trend, quote['price'])
+            
+            result = {
+                'symbol': symbol,
+                'price': quote['price'],
+                'change': quote['change'],
+                'change_percent': quote['change_percent'],
+                'volume': quote['volume'],
+                'high': quote['high'],
+                'low': quote['low'],
+                'rsi': latest_rsi,
+                'macd_signal': macd_signal,
+                'trend': trend,
+                'recommendation': recommendation
+            }
+            
+            logger.info(f"✅ Analysis complete for {symbol}: {recommendation}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error analyzing {symbol}: {type(e).__name__}: {e}", exc_info=True)
             return None
-        
-        # Get RSI
-        rsi_df = self.get_rsi(symbol)
-        latest_rsi = None
-        if rsi_df is not None and len(rsi_df) > 0:
-            latest_rsi = rsi_df.iloc[-1]['RSI']
-        
-        # Get MACD
-        macd_df = self.get_macd(symbol)
-        macd_signal = None
-        if macd_df is not None and len(macd_df) > 0:
-            latest_macd = macd_df.iloc[-1]
-            macd_signal = 'BUY' if latest_macd['MACD'] > latest_macd['MACD_Signal'] else 'SELL'
-        
-        # Get SMAs for trend analysis
-        sma_50 = self.get_sma(symbol, time_period=50)
-        sma_200 = self.get_sma(symbol, time_period=200)
-        
-        trend = None
-        if sma_50 is not None and sma_200 is not None and len(sma_50) > 0 and len(sma_200) > 0:
-            if sma_50.iloc[-1]['SMA'] > sma_200.iloc[-1]['SMA']:
-                trend = 'BULLISH'
-            else:
-                trend = 'BEARISH'
-        
-        # Generate overall recommendation
-        recommendation = self._generate_recommendation(latest_rsi, macd_signal, trend, quote['price'])
-        
-        result = {
-            'symbol': symbol,
-            'price': quote['price'],
-            'change': quote['change'],
-            'change_percent': quote['change_percent'],
-            'volume': quote['volume'],
-            'high': quote['high'],
-            'low': quote['low'],
-            'rsi': latest_rsi,
-            'macd_signal': macd_signal,
-            'trend': trend,
-            'recommendation': recommendation
-        }
-        
-        print(f"✅ Analysis complete for {symbol}: {recommendation}")
-        return result
     
     def _generate_recommendation(self, rsi: Optional[float], 
                                  macd_signal: Optional[str], 
@@ -913,7 +989,7 @@ class StockAdvisorAlphaVantage:
         
         Scoring system:
         - RSI < 30 (oversold): +2 buy signals
-        - RSI 40-60 (neutral): +1 buy signal
+        - RSI 40-60 (neutral): +1 buy signal  
         - RSI > 70 (overbought): +2 sell signals
         - MACD BUY: +2 buy signals
         - MACD SELL: +2 sell signals
@@ -928,11 +1004,11 @@ class StockAdvisorAlphaVantage:
         
         # RSI analysis
         if rsi:
-            if rsi < 30:  # Oversold - good buying opportunity
+            if rsi < 30:  # Oversold
                 buy_signals += 2
-            elif rsi > 70:  # Overbought - potential selling opportunity
+            elif rsi > 70:  # Overbought
                 sell_signals += 2
-            elif 40 < rsi < 60:  # Neutral zone
+            elif 40 < rsi < 60:  # Neutral
                 buy_signals += 1
         
         # MACD analysis
@@ -960,39 +1036,25 @@ class StockAdvisorAlphaVantage:
             return 'HOLD'
     
     def get_full_analysis(self, symbol: str) -> Optional[Dict]:
-        """
-        Gets complete analysis including technical AND fundamental data.
-        This is a premium function that uses multiple API calls.
+        """Gets complete analysis including technical AND fundamental data."""
+        logger.info(f"🔍 Performing full analysis on {symbol}...")
         
-        Args:
-            symbol: Stock ticker
-            
-        Returns:
-            Comprehensive dict with all available data
-        """
-        print(f"🔍 Performing full analysis on {symbol}...")
-        
-        result = {
-            'symbol': symbol,
-            'technical': self.analyze_stock_technical(symbol),
-            'overview': self.get_company_overview(symbol),
-            'earnings': self.get_earnings(symbol)
-        }
-        
-        return result
+        try:
+            result = {
+                'symbol': symbol,
+                'technical': self.analyze_stock_technical(symbol),
+                'overview': self.get_company_overview(symbol),
+                'earnings': self.get_earnings(symbol)
+            }
+            return result
+        except Exception as e:
+            logger.error(f"Error in full analysis for {symbol}: {e}")
+            return None
     
     # ==================== UTILITY FUNCTIONS ====================
     
     def search_symbol(self, keywords: str) -> Optional[List[Dict]]:
-        """
-        Searches for stock symbols by company name or keywords.
-        
-        Args:
-            keywords: Search terms (e.g., 'Apple', 'Microsoft')
-            
-        Returns:
-            List of matching symbols with company info
-        """
+        """Searches for stock symbols by company name or keywords."""
         params = {
             'function': 'SYMBOL_SEARCH',
             'keywords': keywords
@@ -1001,6 +1063,7 @@ class StockAdvisorAlphaVantage:
         data = self._make_request(params)
         
         if not data or 'bestMatches' not in data:
+            logger.warning(f"No search results for '{keywords}'")
             return None
         
         return data['bestMatches']
@@ -1008,25 +1071,33 @@ class StockAdvisorAlphaVantage:
     def clear_cache(self):
         """Clears the internal cache."""
         self.cache = {}
-        print("🗑️ Cache cleared")
+        logger.info("🗑️ Cache cleared")
     
     def get_cache_size(self) -> int:
         """Returns the number of cached responses."""
         return len(self.cache)
+    
+    def get_usage_status(self) -> Dict[str, Any]:
+        """Get API usage status."""
+        return self.usage_tracker.get_status()
+    
+    def print_usage_status(self):
+        """Print API usage status."""
+        self.usage_tracker.print_status()
+    
+    def is_api_depleted(self) -> bool:
+        """Check if daily API limit is depleted."""
+        return self.usage_tracker.is_depleted()
+    
+    def get_remaining_calls(self) -> int:
+        """Get remaining API calls for today."""
+        return self.usage_tracker.get_remaining_calls()
 
 
 # ==================== HELPER FUNCTIONS ====================
 
 def format_large_number(num: float) -> str:
-    """
-    Formats large numbers into readable strings (e.g., 1.2B, 500M).
-    
-    Args:
-        num: Number to format
-        
-    Returns:
-        Formatted string
-    """
+    """Formats large numbers into readable strings."""
     if num >= 1_000_000_000_000:
         return f"${num/1_000_000_000_000:.2f}T"
     elif num >= 1_000_000_000:
@@ -1038,18 +1109,8 @@ def format_large_number(num: float) -> str:
     else:
         return f"${num:.2f}"
 
-
 def calculate_returns(start_price: float, end_price: float) -> float:
-    """
-    Calculates percentage return between two prices.
-    
-    Args:
-        start_price: Initial price
-        end_price: Final price
-        
-    Returns:
-        Return percentage
-    """
+    """Calculates percentage return between two prices."""
     if start_price == 0:
         return 0.0
     return ((end_price - start_price) / start_price) * 100
@@ -1058,38 +1119,35 @@ def calculate_returns(start_price: float, end_price: float) -> float:
 # ==================== EXAMPLE USAGE ====================
 
 if __name__ == "__main__":
-    """
-    Example usage and testing of the StockAdvisorAlphaVantage class.
-    """
+    """Example usage and testing."""
     
-    # Initialize with your API key
-    API_KEY = "ZRBAZ10IY283K3T7"  # Replace with your actual key
+    API_KEY = "ZRBAZ10IY283K3T7"
     advisor = StockAdvisorAlphaVantage(API_KEY)
+    
+    print("\n" + "=" * 80)
+    print("STOCK ADVISOR - ALPHA VANTAGE")
+    print("=" * 80)
     
     # Example 1: Get a stock quote
     print("\n=== Example 1: Stock Quote ===")
     quote = advisor.get_stock_quote('AAPL')
     if quote:
-        print(f"AAPL Price: ${quote['price']}")
-        print(f"Change: {quote['change_percent']}%")
+        print(f"✓ AAPL Price: ${quote['price']}")
+        print(f"  Change: {quote['change_percent']}%")
     
     # Example 2: Technical analysis
     print("\n=== Example 2: Technical Analysis ===")
-    analysis = advisor.analyze_stock_technical('TSLA')
+    analysis = advisor.analyze_stock_technical('MSFT')
     if analysis:
-        print(f"Symbol: {analysis['symbol']}")
-        print(f"Price: ${analysis['price']}")
-        print(f"RSI: {analysis['rsi']}")
-        print(f"MACD Signal: {analysis['macd_signal']}")
-        print(f"Trend: {analysis['trend']}")
-        print(f"Recommendation: {analysis['recommendation']}")
+        print(f"✓ Symbol: {analysis['symbol']}")
+        print(f"  Price: ${analysis['price']}")
+        print(f"  RSI: {analysis['rsi']}")
+        print(f"  MACD: {analysis['macd_signal']}")
+        print(f"  Trend: {analysis['trend']}")
+        print(f"  Recommendation: {analysis['recommendation']}")
     
-    # Example 3: Company overview
-    print("\n=== Example 3: Company Overview ===")
-    overview = advisor.get_company_overview('MSFT')
-    if overview:
-        print(f"Company: {overview.get('Name')}")
-        print(f"Sector: {overview.get('Sector')}")
-        print(f"Market Cap: {format_large_number(float(overview.get('MarketCapitalization', 0)))}")
+    # Show API usage
+    print("\n=== API Usage ===")
+    advisor.print_usage_status()
     
     print("\n✅ Examples complete!")

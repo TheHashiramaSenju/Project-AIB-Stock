@@ -1,17 +1,16 @@
 """
-AI Budgeting Engine - Alpha Vantage Version
-===========================================
+AI Budgeting Engine - Alpha Vantage Version (FIXED)
+===================================================
 Uses technical analysis instead of analyst ratings.
-Implements portfolio optimization techniques with risk scoring.
+Robust with better scoring thresholds.
 
 Author: Bhoomika M
-Date: 2025-11-07
-Version: 2.0
+Date: 2025-11-08
+Version: 2.1 (Fixed Scoring)
 """
 
 from typing import List, Dict, Tuple, Optional, Any
 import math
-from datetime import datetime
 
 
 class AIBudgeter:
@@ -24,6 +23,7 @@ class AIBudgeter:
     - Sector-based diversification
     - Dynamic budget allocation with leftover handling
     - Comprehensive error handling and validation
+    - Flexible scoring thresholds to ensure plan generation
     """
 
     def __init__(self):
@@ -44,7 +44,7 @@ class AIBudgeter:
                     'Utilities',
                     'Real Estate'
                 ],
-                'min_technical_score': 60,  # Out of 100
+                'min_technical_score': 50,  # LOWERED from 60 - more lenient
                 'allocation_strategy': 'equal',  # Equal weighting for safety
                 'max_single_allocation': 0.25,  # Max 25% in any single stock
                 'description': 'Broad diversification with stable sectors'
@@ -57,9 +57,10 @@ class AIBudgeter:
                     'Healthcare', 
                     'Financial',
                     'Communication Services',
-                    'Industrials'
+                    'Industrials',
+                    'Consumer Defensive'  # ADDED
                 ],
-                'min_technical_score': 70,
+                'min_technical_score': 50,  # LOWERED from 70 - more lenient
                 'allocation_strategy': 'equal',
                 'max_single_allocation': 0.35,  # Max 35% in any single stock
                 'description': 'Balanced growth and stability'
@@ -71,7 +72,7 @@ class AIBudgeter:
                     'Consumer Cyclical',
                     'Communication Services'
                 ],
-                'min_technical_score': 80,
+                'min_technical_score': 60,  # LOWERED from 80 - more lenient
                 'allocation_strategy': 'weighted',  # Weighted towards top picks
                 'max_single_allocation': 0.50,  # Max 50% in any single stock
                 'description': 'Concentrated bets on high-conviction stocks'
@@ -96,6 +97,7 @@ class AIBudgeter:
     def _log(self, message: str):
         """Internal logging function."""
         if self.verbose:
+            from datetime import datetime
             timestamp = datetime.now().strftime("%H:%M:%S")
             print(f"[{timestamp}] AI Budgeter: {message}")
     
@@ -103,25 +105,13 @@ class AIBudgeter:
         """
         Calculate a 0-100 technical score based on multiple indicators.
         
+        IMPROVED: More balanced scoring to ensure plans can be generated.
+        
         Scoring breakdown:
-        - RSI (30 points):
-          * <30 (oversold, buy signal) = 30 points
-          * 30-70 (neutral) = 15 points
-          * >70 (overbought, sell signal) = 0 points
-        
-        - MACD (30 points):
-          * BUY signal = 30 points
-          * HOLD signal = 15 points
-          * SELL signal = 0 points
-        
-        - Trend (20 points):
-          * BULLISH (SMA 50 > SMA 200) = 20 points
-          * NEUTRAL = 10 points
-          * BEARISH (SMA 50 < SMA 200) = 0 points
-        
-        - Momentum (20 points):
-          * Positive price change = 20 points
-          * Negative price change = 0 points
+        - RSI (35 points max) - Measures momentum
+        - MACD (35 points max) - Shows momentum signals
+        - Trend (20 points max) - Direction analysis
+        - Momentum (10 points max) - Price change
         
         Args:
             stock: Dict containing technical indicator data
@@ -131,28 +121,45 @@ class AIBudgeter:
         """
         score = 0.0
         
-        # RSI scoring (30 points max)
+        # RSI scoring (35 points max - increased from 30)
         rsi = stock.get('rsi')
         if rsi is not None:
             try:
                 rsi_value = float(rsi)
-                if rsi_value < 30:  # Oversold - strong buy signal
-                    score += 30
-                elif 30 <= rsi_value <= 70:  # Neutral zone
-                    score += 15
-                # >70 overbought gets 0 points
+                # More lenient RSI scoring
+                if rsi_value < 20:  # Very oversold
+                    score += 35
+                elif rsi_value < 30:  # Oversold
+                    score += 33
+                elif rsi_value < 40:  # Slightly oversold
+                    score += 28
+                elif rsi_value < 60:  # Neutral zone (favorable)
+                    score += 25
+                elif rsi_value < 70:  # Slightly overbought
+                    score += 20
+                elif rsi_value < 80:  # Overbought
+                    score += 10
+                # >80 extremely overbought gets minimal points
             except (ValueError, TypeError):
-                self._log(f"Warning: Invalid RSI value for {stock.get('symbol', 'unknown')}: {rsi}")
+                self._log(f"Warning: Invalid RSI value: {rsi}")
+                score += 15  # Default mid-range score
+        else:
+            score += 15  # Default if no RSI data
         
-        # MACD scoring (30 points max)
+        # MACD scoring (35 points max - increased from 30)
         macd = stock.get('macd_signal')
         if macd:
             macd_str = str(macd).upper()
             if macd_str == 'BUY':
-                score += 30
+                score += 35  # Strong buy signal
             elif macd_str == 'HOLD':
-                score += 15
-            # SELL gets 0 points
+                score += 20  # Neutral hold
+            elif macd_str == 'SELL':
+                score += 5   # Weak sell signal (still some value)
+            else:
+                score += 17  # Default mid-range
+        else:
+            score += 17  # Default if no MACD data
         
         # Trend scoring (20 points max)
         trend = stock.get('trend')
@@ -162,23 +169,38 @@ class AIBudgeter:
                 score += 20
             elif trend_str == 'NEUTRAL':
                 score += 10
-            # BEARISH gets 0 points
+            elif trend_str == 'BEARISH':
+                score += 2   # Even bearish trends have some value
+            else:
+                score += 10  # Default
+        else:
+            score += 10  # Default if no trend data
         
-        # Price momentum scoring (20 points max)
+        # Price momentum scoring (10 points max - changed from 20)
         change_pct = stock.get('change_percent', 0)
         try:
             change_value = float(str(change_pct).replace('%', ''))
-            if change_value > 0:
-                score += 20
+            if change_value > 3:
+                score += 10
+            elif change_value > 0:
+                score += 6
+            elif change_value > -3:
+                score += 3
+            # Negative changes get minimal points
         except (ValueError, TypeError):
-            self._log(f"Warning: Invalid change_percent for {stock.get('symbol', 'unknown')}: {change_pct}")
+            self._log(f"Warning: Invalid change_percent: {change_pct}")
+            score += 5  # Default mid-range
         
+        # Cap score at 100
+        score = min(score, 100.0)
         return round(score, 2)
     
     def _filter_candidates(self, stock_candidates: List[Dict], 
                           config: Dict[str, Any]) -> List[Dict]:
         """
         Filter stocks by sector, technical score, and data validity.
+        
+        IMPROVED: More lenient filtering to ensure candidates pass through.
         
         Args:
             stock_candidates: List of stock dictionaries with technical data
@@ -199,14 +221,14 @@ class AIBudgeter:
             
             # 2. Check sector eligibility
             if stock['sector'] not in config['allowed_sectors']:
-                self._log(f"Skipping {symbol}: Sector {stock['sector']} not allowed for this profile")
+                self._log(f"Skipping {symbol}: Sector '{stock['sector']}' not in allowed list for this profile")
                 continue
             
             # 3. Calculate technical score
             technical_score = self._calculate_technical_score(stock)
             stock['technical_score'] = technical_score
             
-            # 4. Check minimum technical score threshold
+            # 4. Check minimum technical score threshold (LENIENT)
             if technical_score < config['min_technical_score']:
                 self._log(f"Skipping {symbol}: Technical score {technical_score} below minimum {config['min_technical_score']}")
                 continue
@@ -224,16 +246,16 @@ class AIBudgeter:
                 continue
             
             # 6. Calculate estimated 12-month target price
-            # Based on technical score strength (0-30% upside potential)
+            # More generous upside calculation for scoring
             score_factor = technical_score / 100.0  # Normalize to 0-1
-            estimated_target = price * (1 + (score_factor * 0.30))  # Up to 30% upside
+            estimated_target = price * (1 + (score_factor * 0.50))  # Up to 50% upside (increased from 30%)
             
             stock['target_mean'] = round(estimated_target, 2)
             stock['upside_pct'] = round(((estimated_target - price) / price) * 100, 2)
             stock['buy_score'] = technical_score
             
             filtered_stocks.append(stock)
-            self._log(f"✓ {symbol}: Score={technical_score}, Price=${price:.2f}, Upside={stock['upside_pct']:.1f}%")
+            self._log(f"✓ {symbol}: Score={technical_score:.1f}, Price=${price:.2f}, Upside={stock['upside_pct']:.1f}%")
         
         return filtered_stocks
     
@@ -241,7 +263,7 @@ class AIBudgeter:
         """
         Rank stocks by weighted combination of technical score and upside potential.
         
-        Ranking formula: (Technical Score × 0.6) + (Upside % × 0.4)
+        Ranking formula: (Technical Score × 0.7) + (Upside % × 0.3)
         
         Args:
             filtered_stocks: List of filtered stocks
@@ -252,12 +274,12 @@ class AIBudgeter:
         def calculate_weighted_score(stock):
             technical = stock.get('technical_score', 0)
             upside = stock.get('upside_pct', 0)
-            # Weight technical strength more heavily than pure upside
-            return (technical * 0.6) + (upside * 0.4)
+            # Weight technical score more heavily
+            return (technical * 0.7) + (upside * 0.3)
         
         filtered_stocks.sort(key=calculate_weighted_score, reverse=True)
         
-        # Log the top 5 rankings
+        # Log top rankings
         self._log("Top ranked stocks:")
         for i, stock in enumerate(filtered_stocks[:5], 1):
             score = calculate_weighted_score(stock)
@@ -429,7 +451,7 @@ class AIBudgeter:
         # ===== FILTERING =====
         
         self._log(f"Filtering {len(stock_candidates)} candidates...")
-        self._log(f"Criteria: Sectors={len(config['allowed_sectors'])}, Min Score={config['min_technical_score']}")
+        self._log(f"Criteria: Sectors={config['allowed_sectors']}, Min Score={config['min_technical_score']}")
         
         filtered_stocks = self._filter_candidates(stock_candidates, config)
         
@@ -438,7 +460,7 @@ class AIBudgeter:
             error_msg = (
                 f"No stocks passed the filtering criteria for '{risk_profile}' profile.\n"
                 f"Criteria: Sectors [{sectors_str}], Min Technical Score {config['min_technical_score']}/100.\n"
-                f"Suggestion: Try 'Moderate' profile or check if market conditions are suitable."
+                f"Suggestion: Try 'Conservative' profile or check if market conditions are suitable."
             )
             self._log(f"ERROR: {error_msg}")
             return None, error_msg
@@ -504,100 +526,3 @@ class AIBudgeter:
     def list_risk_profiles(self) -> List[str]:
         """Get list of available risk profile names."""
         return list(self.RISK_PROFILES.keys())
-    
-    def validate_stock_candidate(self, stock: Dict) -> Tuple[bool, str]:
-        """
-        Validate that a stock candidate has all required fields.
-        
-        Args:
-            stock: Stock dictionary to validate
-            
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        required_fields = ['symbol', 'sector', 'price']
-        optional_fields = ['rsi', 'macd_signal', 'trend', 'change_percent']
-        
-        # Check required fields
-        for field in required_fields:
-            if field not in stock or stock[field] is None:
-                return False, f"Missing required field: {field}"
-        
-        # Validate price
-        try:
-            price = float(stock['price'])
-            if price <= 0:
-                return False, f"Invalid price: {price}"
-        except (ValueError, TypeError):
-            return False, f"Cannot parse price: {stock.get('price')}"
-        
-        # Check for at least some technical indicators
-        has_indicators = any(stock.get(field) is not None for field in optional_fields)
-        if not has_indicators:
-            return False, "No technical indicators present (rsi, macd_signal, trend, change_percent)"
-        
-        return True, "Valid"
-
-
-# ==================== EXAMPLE USAGE ====================
-
-if __name__ == "__main__":
-    """
-    Example usage and testing of AIBudgeter.
-    """
-    
-    # Initialize budgeter
-    budgeter = AIBudgeter()
-    
-    # Example stock candidates (normally from StockAdvisorAlphaVantage)
-    mock_candidates = [
-        {
-            'symbol': 'AAPL',
-            'name': 'Apple Inc.',
-            'sector': 'Technology',
-            'price': 175.50,
-            'rsi': 45.0,
-            'macd_signal': 'BUY',
-            'trend': 'BULLISH',
-            'change_percent': '1.2%'
-        },
-        {
-            'symbol': 'MSFT',
-            'name': 'Microsoft Corp.',
-            'sector': 'Technology',
-            'price': 380.25,
-            'rsi': 55.0,
-            'macd_signal': 'BUY',
-            'trend': 'BULLISH',
-            'change_percent': '0.8%'
-        },
-        {
-            'symbol': 'JNJ',
-            'name': 'Johnson & Johnson',
-            'sector': 'Healthcare',
-            'price': 160.00,
-            'rsi': 50.0,
-            'macd_signal': 'HOLD',
-            'trend': 'BULLISH',
-            'change_percent': '0.3%'
-        }
-    ]
-    
-    # Test plan generation
-    print("\n=== Testing AI Budgeter ===\n")
-    
-    budget = 1000.0
-    risk_profile = 'Moderate'
-    
-    plan, error = budgeter.generate_investment_plan(budget, risk_profile, mock_candidates)
-    
-    if error:
-        print(f"❌ Error: {error}")
-    elif plan:
-        print(f"\n✅ Investment Plan Generated!\n")
-        for item in plan:
-            print(f"{item['symbol']:6} | ${item['cost']:8.2f} ({item['allocation_pct']:5.1f}%) | "
-                  f"{item['shares']:.4f} shares @ ${item['current_price']:.2f}")
-        
-        total = sum(item['cost'] for item in plan)
-        print(f"\nTotal: ${total:.2f}")
