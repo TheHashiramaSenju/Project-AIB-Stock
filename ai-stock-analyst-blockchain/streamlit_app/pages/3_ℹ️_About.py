@@ -246,7 +246,7 @@ with col2:
 
 st.divider()
 
-# Security
+'''# Security
 st.header("🔒 Security & Privacy")
 
 col1, col2 = st.columns(2)
@@ -271,7 +271,7 @@ with col2:
     - ⚠️ DYOR (Do Your Own Research)
     """)
 
-st.divider()
+st.divider()'''
 
 # FAQ
 st.header("❓ Frequently Asked Questions")
