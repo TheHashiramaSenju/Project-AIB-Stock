@@ -16,7 +16,7 @@ class BlockchainPortfolioManager:
         Initialize blockchain connection
         
         Args:
-            provider_url: RPC endpoint URL
+            provider_url: RPC endpoint URL 
         """
         self.provider_url = provider_url
         self.w3 = None
